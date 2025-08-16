@@ -32,6 +32,34 @@ log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
 
+# Ensure system DNS resolver works (keep systemd-resolved enabled and resolv.conf present)
+setup_system_dns() {
+    if systemctl list-unit-files | grep -q '^systemd-resolved\.service'; then
+        systemctl enable systemd-resolved 2>/dev/null || true
+        # Prefer stub resolver; fall back to full if unavailable
+        if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        elif [ -f /run/systemd/resolve/resolv.conf ]; then
+            ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+        fi
+    fi
+}
+
+# Ensure network time sync is enabled and perform an initial sync
+setup_time_sync() {
+    log_info "Configuring network time synchronization"
+    if systemctl list-unit-files | grep -q '^systemd-timesyncd\.service'; then
+        systemctl enable systemd-timesyncd 2>/dev/null || true
+        systemctl start systemd-timesyncd 2>/dev/null || true
+        # Enable NTP via timedatectl (idempotent)
+        timedatectl set-ntp true 2>/dev/null || true
+        # Give it a brief moment to sync if just enabled
+        sleep 1
+    else
+        log_warn "systemd-timesyncd not available; consider installing chrony or ntp"
+    fi
+}
+
 log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
@@ -111,6 +139,7 @@ install_packages() {
                 ca-certificates
                 openvpn
                 jq
+                systemd-timesyncd
             )
             # Merge board-specific packages if plugin defines them
             if declare -F board_required_packages >/dev/null; then
@@ -245,12 +274,9 @@ EOF
 setup_dhcp_server() {
     log_info "Configuring DHCP server..."
     
-    # Stop and disable systemd-resolved to avoid port 53 conflicts
-    if systemctl is-active systemd-resolved &>/dev/null; then
-        log_info "Disabling systemd-resolved to avoid conflicts..."
-        systemctl stop systemd-resolved
-        systemctl disable systemd-resolved
-    fi
+    # Keep systemd-resolved enabled for the host's own DNS.
+    # dnsmasq will bind only to $USB_INTERFACE so there is no port 53 conflict.
+    # (see interface= and bind-interfaces below)
     
     # Backup original dnsmasq config if exists
     [ -f /etc/dnsmasq.conf ] && cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
@@ -270,6 +296,7 @@ dhcp-option=6,$USB_IP
 
 # DNS Configuration
 port=53
+listen-address=$USB_IP
 server=8.8.8.8
 server=1.1.1.1
 cache-size=150
@@ -921,6 +948,8 @@ main() {
     detect_distro
     load_board_plugin
     install_packages
+    setup_system_dns
+    setup_time_sync
     if declare -F board_apply_dts_overlay >/dev/null; then
         log_info "Applying board DTS overlay via plugin"
         board_apply_dts_overlay
