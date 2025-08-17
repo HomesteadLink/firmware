@@ -1,6 +1,6 @@
 # USB VPN Router
 
-![](./images/routing.svg)
+![](./images/routing.webp)
 
 Turn your Orange Pi (or similar SBC) into a secure USB ethernet gadget that routes all connected device traffic through VPN with automatic failover.
 
