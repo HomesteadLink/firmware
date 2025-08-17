@@ -137,3 +137,15 @@ https://www.armbian.com/orange-pi-zero-2w/
 ## License
 
 MIT License - see LICENSE file for details
+
+
+## RNDIS and ECM
+
+With ECM and RNDIS active simultaneously:
+
+The device may expose two USB NICs (e.g., usb0 and usb1). Which becomes usb0 is not guaranteed across boots.
+Your config currently pins to USB_INTERFACE="usb0":
+dnsmasq binds to usb0
+systemd-networkd and other flows configure usb0
+nftables forward rules reference USB_INTERFACE
+On Windows, the active path will be RNDIS; on macOS/Linux, ECM. If RNDIS becomes usb1, Windows clients won’t get DHCP because dnsmasq is bound to usb0.

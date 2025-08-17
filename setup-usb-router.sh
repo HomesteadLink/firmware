@@ -140,6 +140,7 @@ install_packages() {
                 openvpn
                 jq
                 systemd-timesyncd
+                systemd-resolved
             )
             # Merge board-specific packages if plugin defines them
             if declare -F board_required_packages >/dev/null; then
@@ -187,25 +188,79 @@ setup_usb_gadget() {
         return
     fi
     
-    # Standard configuration for generic boards
-    cat > /etc/modules-load.d/usb_gadget.conf << EOF
-# USB Ethernet Gadget
-g_ether
-EOF
-    
-    # Create modprobe configuration for g_ether
-    cat > /etc/modprobe.d/g_ether.conf << EOF
-# Use CDC-ECM mode for better macOS compatibility
-options g_ether use_eem=0 use_ecm=1
-EOF
+    # Composite gadget via configfs: ACM (serial) + ECM (ethernet)
+    log_info "Setting up composite USB gadget (ACM + ECM) via configfs"
+    local GADGET_SH="/usr/local/sbin/setup-usb-gadget.sh"
+    mkdir -p /usr/local/sbin
+    cat >"$GADGET_SH" <<'EOSH'
+#!/bin/sh
+set -e
+modprobe libcomposite 2>/dev/null || true
+# Mount configfs if not already
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+G=/sys/kernel/config/usb_gadget/pi
+[ -d "$G" ] || mkdir -p "$G"
+cd "$G"
+# Linux Foundation IDs (gadget)
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+mkdir -p strings/0x409
+echo "USBVPN"       > strings/0x409/manufacturer
+echo "USB VPN Router" > strings/0x409/product
+echo "0001"          > strings/0x409/serialnumber
+mkdir -p configs/c.1/strings/0x409
+echo "ACM+ECM+RNDIS" > configs/c.1/strings/0x409/configuration
+# Functions
+mkdir -p functions/acm.usb0
+mkdir -p functions/ecm.usb0
+mkdir -p functions/rndis.usb0
+# Optional MACs can be provided via environment
+[ -n "$DEV_MAC" ]  && echo "$DEV_MAC"  > functions/ecm.usb0/dev_addr || true
+[ -n "$HOST_MAC" ] && echo "$HOST_MAC" > functions/ecm.usb0/host_addr || true
+[ -n "$DEV_MAC" ]  && echo "$DEV_MAC"  > functions/rndis.usb0/dev_addr || true
+[ -n "$HOST_MAC" ] && echo "$HOST_MAC" > functions/rndis.usb0/host_addr || true
+ln -sf functions/acm.usb0 configs/c.1/
+ln -sf functions/ecm.usb0 configs/c.1/
+ln -sf functions/rndis.usb0 configs/c.1/
+# Enable Microsoft OS descriptors for better Windows support
+mkdir -p os_desc
+echo 1 > os_desc/use
+echo MSFT100 > os_desc/qw_sign
+echo 0x01 > os_desc/b_vendor_code
+ln -sf configs/c.1 os_desc
+# Bind to first available UDC
+UDC=$(ls /sys/class/udc 2>/dev/null | head -n1 || true)
+[ -n "$UDC" ] && echo "$UDC" > UDC || true
+EOSH
+    chmod +x "$GADGET_SH"
 
-    # Load the module now if not already loaded
-    if ! lsmod | grep -q g_ether; then
-        # Load without parameters so it uses /etc/modprobe.d/g_ether.conf
-        modprobe g_ether
-        sleep 2
-    else
-        log_info "g_ether already loaded - may need reboot for new options to take effect"
+    # systemd unit to run gadget setup early
+    mkdir -p /etc/systemd/system
+    cat >/etc/systemd/system/usb-gadget.service <<'EOF'
+[Unit]
+Description=USB Gadget (ACM + ECM) bringup
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/setup-usb-gadget.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -sf ../usb-gadget.service /etc/systemd/system/multi-user.target.wants/usb-gadget.service
+
+    # Enable login on USB serial (ttyGS0) when available
+    local GETTY_TEMPLATE=""
+    for p in /lib/systemd/system/serial-getty@.service /usr/lib/systemd/system/serial-getty@.service; do
+        [ -f "$p" ] && GETTY_TEMPLATE="$p" && break
+    done
+    if [ -n "$GETTY_TEMPLATE" ]; then
+        mkdir -p /etc/systemd/system/getty.target.wants
+        ln -sf "$GETTY_TEMPLATE" /etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
     fi
 }
 
@@ -231,7 +286,7 @@ setup_network_interface() {
         
         cat > /etc/systemd/network/20-usb0.network << EOF
 [Match]
-Name=$USB_INTERFACE
+Name=usb*
 
 [Network]
 Address=$USB_IP/24
@@ -287,7 +342,7 @@ setup_dhcp_server() {
     # Create main dnsmasq configuration
     cat > /etc/dnsmasq.conf << EOF
 # DHCP Configuration for USB Ethernet Gadget
-interface=$USB_INTERFACE
+interface=usb*
 bind-interfaces
 except-interface=lo
 dhcp-range=$USB_DHCP_START,$USB_DHCP_END,12h
@@ -330,100 +385,15 @@ EOF
 setup_nat() {
     log_info "Configuring IP forwarding and NAT..."
     
-    # Enable IP forwarding
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/30-ip-forward.conf
-    sysctl -w net.ipv4.ip_forward=1
-    
-    # Use nftables: create dedicated tables that lock down forwarding and apply masquerade
-    # Clean up previous runs
-    if command -v nft &>/dev/null; then
-        nft list table inet usb_router_filter &>/dev/null && nft delete table inet usb_router_filter || true
-        nft list table ip usb_router_nat &>/dev/null && nft delete table ip usb_router_nat || true
-        
-        # Build ruleset: only allow usb0 -> tailscale0/tun0 and established back; drop everything else on forward
-        nft -f - <<EOF
-table inet usb_router_filter {
-  chain forward {
-    type filter hook forward priority 0;
-    policy drop;
-    ct state established,related accept
-    iifname "${USB_INTERFACE}" oifname "${TAILSCALE_INTERFACE}" accept
-    iifname "${USB_INTERFACE}" oifname "${OPENVPN_INTERFACE}" accept
-    oifname "${USB_INTERFACE}" ct state related,established accept
-  }
-}
-
-table ip usb_router_nat {
-  chain postrouting {
-    type nat hook postrouting priority 100;
-    ip saddr ${USB_NETWORK} oifname "${TAILSCALE_INTERFACE}" masquerade
-    ip saddr ${USB_NETWORK} oifname "${OPENVPN_INTERFACE}" masquerade
-  }
-}
+    # Enable IP forwarding (IPv4 and IPv6) in one place
+    cat > /etc/sysctl.d/30-ip-forward.conf << EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
 EOF
-        log_info "Applied nftables rules: forward only usb0->tailscale0/tun0 with masquerade"
-    else
-        log_warn "nft command not found; cannot apply nftables rules"
-    fi
+    sysctl -p /etc/sysctl.d/30-ip-forward.conf
     
-    if [ "$USE_TAILSCALE_EXIT" = "true" ]; then
-        log_info "Setting up VPN-only routing for USB clients"
-        
-        # Create custom routing table for USB clients
-        if ! grep -q "usb_vpn" /etc/iproute2/rt_tables; then
-            echo "200 usb_vpn" >> /etc/iproute2/rt_tables
-        fi
-        
-        # Only route USB client traffic through VPN, not the device's own traffic
-        ip rule del from $USB_NETWORK table usb_vpn 2>/dev/null || true
-        ip rule add from $USB_NETWORK table usb_vpn priority 200
-        
-        # Wait for Tailscale interface
-        local attempts=0
-        while [ $attempts -lt 10 ] && ! ip link show $TAILSCALE_INTERFACE &>/dev/null; do
-            log_info "Waiting for Tailscale interface..."
-            sleep 2
-            ((attempts++))
-        done
-        
-        # Add default route through Tailscale for USB clients only
-        if ip link show $TAILSCALE_INTERFACE &>/dev/null; then
-            local ts_gateway=$(ip route show dev $TAILSCALE_INTERFACE | grep -E '^100\.' | head -1 | awk '{print $1}')
-            if [ -n "$ts_gateway" ]; then
-                ip route add default via $ts_gateway dev $TAILSCALE_INTERFACE table usb_vpn 2>/dev/null || true
-            fi
-        fi
-        
-        # Forwarding and masquerade already handled by nftables above
-        log_info "USB clients can ONLY route through VPN interfaces (nftables enforced)"
-        
-        # Ensure local traffic is not affected
-        ip rule add from 192.168.0.0/16 to 192.168.0.0/16 table main priority 50
-        ip rule add from 10.0.0.0/8 to 10.0.0.0/8 table main priority 50
-        
-        log_info "No leaks possible: forwarding restricted to ${TAILSCALE_INTERFACE} and ${OPENVPN_INTERFACE}"
-    else
-        # Even when not using Tailscale exit, keep forwarding restricted to VPN interfaces only
-        log_info "Restricting forwarding to VPN interfaces only via nftables"
-    fi
-    
-    # Persist firewall rules using netfilter-persistent and nftables
-    if command -v netfilter-persistent &>/dev/null; then
-        log_info "Saving firewall rules via netfilter-persistent"
-        netfilter-persistent save || true
-    fi
 
-    # Detect if we are running inside a chroot
-    in_chroot=false
-    if command -v systemd-detect-virt &>/dev/null && systemd-detect-virt --chroot --quiet; then
-        in_chroot=true
-    fi
-
-    if command -v nft &>/dev/null; then
-        if [ "$in_chroot" = true ]; then
-            # In chroot: don't query host kernel ruleset; write our intended config directly
-            log_info "Chroot detected: writing nftables config to /etc/nftables.conf without querying kernel"
-            cat > /etc/nftables.conf << EOF
+    cat > /etc/nftables.conf << EOF
 #!/usr/sbin/nft -f
 flush ruleset
 
@@ -432,9 +402,9 @@ table inet usb_router_filter {
     type filter hook forward priority 0;
     policy drop;
     ct state established,related accept
-    iifname "${USB_INTERFACE}" oifname "${TAILSCALE_INTERFACE}" accept
-    iifname "${USB_INTERFACE}" oifname "${OPENVPN_INTERFACE}" accept
-    oifname "${USB_INTERFACE}" ct state related,established accept
+    iifname "usb*" oifname "${TAILSCALE_INTERFACE}" accept
+    iifname "usb*" oifname "${OPENVPN_INTERFACE}" accept
+    oifname "usb*" ct state related,established accept
   }
 }
 
@@ -446,17 +416,7 @@ table ip usb_router_nat {
   }
 }
 EOF
-            # Skip systemctl in chroot
-        else
-            # On a real system, persist the live ruleset and enable service
-            log_info "Writing current nftables ruleset to /etc/nftables.conf and enabling nftables service"
-            nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-            systemctl enable nftables 2>/dev/null || true
-            systemctl restart nftables 2>/dev/null || true
-        fi
-    fi
-
-    # Note: iptables persistence not used; nftables is authoritative
+    systemctl enable nftables
 }
 
 # Install and configure OpenVPN
@@ -507,31 +467,7 @@ setup_tailscale() {
     fi
     
     systemctl enable tailscaled
-    systemctl start tailscaled
-    
-    # Configure Tailscale to accept subnet routes and act as exit node
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-tailscale.conf << EOF
-# Enable IP forwarding for Tailscale
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-EOF
-    sysctl -p /etc/sysctl.d/99-tailscale.conf
-    
-    # If USE_TAILSCALE_EXIT is true, we'll use split routing (USB clients only)
-    if [ "$USE_TAILSCALE_EXIT" = "true" ]; then
-        log_info "Checking Tailscale authentication status..."
-        if tailscale status &>/dev/null; then
-            log_info "Tailscale is authenticated"
-            log_info "Split routing will be configured - USB clients through VPN, device keeps local access"
-            
-            # Make sure we allow local network access
-            tailscale set --exit-node-allow-lan-access=true 2>/dev/null || true
-        else
-            log_warn "Tailscale not authenticated yet. Run 'tailscale up' first"
-        fi
-    fi
-    
+
     log_info "Tailscale installed. Commands:"
     log_info "  tailscale up                    - Authenticate with Tailscale"
     log_info "  usb-router-tailscale on         - Route USB clients through Tailscale"
