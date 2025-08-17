@@ -1,5 +1,6 @@
 # USB VPN Router
 
+![](./images/concept1.webp)
 ![](./images/routing.webp)
 
 ## **Who it’s for (ICP) and core value**
