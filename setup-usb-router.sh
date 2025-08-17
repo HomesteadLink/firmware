@@ -897,43 +897,8 @@ main() {
     setup_openvpn
     setup_tailscale
     create_helper_scripts
-    
-    # Restart services
-    log_info "Restarting services..."
-    systemctl restart systemd-networkd || true
-    
-    # Try to bring up usb0 if module is loaded
-    if lsmod | grep -q g_ether; then
-        sleep 2
-        ip link set $USB_INTERFACE up 2>/dev/null || true
-        systemctl restart dnsmasq || true
-    fi
-    
+
     # Check if reboot is required (for RK3399 boards)
-    if [ "${REBOOT_REQUIRED:-false}" = "true" ]; then
-        log_warn "IMPORTANT: REBOOT REQUIRED!"
-        log_warn "The USB device tree overlay has been applied."
-        log_warn "You must reboot for USB peripheral mode to work."
-        log_warn ""
-        log_warn "For Orange Pi 4 LTS: Due to a FUSB302 initialization bug,"
-        log_warn "connect power AND USB-C cable simultaneously during boot"
-        log_warn "for best results. This ensures peripheral mode is properly set."
-        log_info ""
-        read -p "Reboot now? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            reboot
-        fi
-    else
-        # Check if UDC is available (for boards that don't need reboot)
-        if ls /sys/class/udc/ 2>/dev/null | grep -q .; then
-            log_info "USB Device Controller found: $(ls /sys/class/udc/)"
-            log_info "USB gadget should be working!"
-        else
-            log_warn "No USB Device Controller found. You may need to reboot."
-        fi
-    fi
-    
     log_info "Setup complete!"
     log_info ""
     log_info "Next steps:"
@@ -947,15 +912,6 @@ main() {
     log_info "  usb-router-tailscale       - Switch between local/Tailscale routing"
     log_info "  usb-router-vpn-monitor     - Check VPN failover status"
     log_info "  usb-interface-watchdog     - Check USB interface watchdog"
-    log_info ""
-    log_info "VPN Failover:"
-    log_info "  - Tailscale is primary VPN (when available)"
-    log_info "  - OpenVPN automatically takes over if Tailscale fails"
-    log_info "  - Monitor service: systemctl status usb-router-vpn-monitor"
-    log_info ""
-    log_info "To configure OpenVPN backup:"
-    log_info "  1. Place .ovpn file in /etc/openvpn/client/"
-    log_info "  2. Start: systemctl start openvpn-client@configname"
 }
 
 # Run main function
