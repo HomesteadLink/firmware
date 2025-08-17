@@ -2,18 +2,28 @@
 
 ![](./images/routing.webp)
 
-Turn your Orange Pi (or similar SBC) into a secure USB ethernet gadget that routes all connected device traffic through VPN with automatic failover.
+## **Who it’s for (ICP) and core value**
 
-![Orange Pi Zero USB VPN Router Setup](images/orangepi-zero-setup.webp)
+- **ICP**: Digital nomads, founders, traders, streamers, journalists, ad buyers, QA teams, remote employees needing “home-like” IP.
+- **Primary value**:
+    - Zero setup: plug via USB; macOS/Windows/Linux see it as a wired adapter (virtual Ethernet).
+    - Residential IP egress: your traffic exits from a stable residential/home IP (your own node or managed pool).
+    - Local network: connect multiple devices to the box; all share the same residential IP.
+    - Deterministic networking: bypass flaky per‑device VPN configs; consistent routing rules at the box.
 
-## Features
+## **Key use cases**
 
-- **USB Ethernet Gadget**: Connect any device via USB and get network access
-- **VPN-Only Routing**: All USB client traffic is forced through VPN (no leaks)
-- **Automatic Failover**: Seamlessly switches between Tailscale and OpenVPN
-- **Split Routing**: Device maintains local network access while clients use VPN
-- **Kill Switch**: Traffic is blocked if all VPNs are down
-- **IPv4 & IPv6 Support**: Full dual-stack protection
+- **“Home IP on the go”**: banking portals, corporate allowlists, SaaS geofencing, ad platforms.
+- **Streaming reliability**: residential IP reduces blocks vs datacenter IPs.
+- **Testing/QA**/ad verification__: consistent geo, repeatable results.
+- **Journalists/field teams**: consistent, safer egress with simple plug‑in.
+
+## **Differentiation**
+
+- **True plug‑and‑play**: USB NIC shows up instantly; no per‑device VPN.
+- **Residential IP first**: compliant sourcing; predictable allowlisting.
+- **Multi-device**: USB host + optional local Wi‑Fi/LAN behind NAT.
+- **Minimalism**: no app install, no OS drivers, no captive portal per device.
 
 ## Quick Start
 
@@ -21,11 +31,7 @@ Turn your Orange Pi (or similar SBC) into a secure USB ethernet gadget that rout
 # Clone the repository
 git clone https://github.com/yourusername/usb-vpn-router.git
 cd usb-vpn-router
-
-# Run setup (routes USB clients through VPN)
-sudo USE_TAILSCALE_EXIT=true bash setup-usb-router.sh
-
-# Connect your device via USB and it will receive an IP via DHCP
+./setup-usb-router.sh
 ```
 
 ## How It Works
@@ -38,25 +44,6 @@ sudo USE_TAILSCALE_EXIT=true bash setup-usb-router.sh
 
 ## Configuration
 
-### VPN Setup
-
-**Tailscale (Primary):**
-```bash
-# Authenticate
-tailscale up
-
-# Device will auto-detect available exit nodes
-```
-
-**OpenVPN (Backup):**
-```bash
-# Place config in /etc/openvpn/client/
-cp your-config.ovpn /etc/openvpn/client/backup.conf
-
-# Start service
-systemctl start openvpn-client@backup
-```
-
 
 ### useful commands
 
@@ -64,27 +51,15 @@ systemctl start openvpn-client@backup
 iw dev wlan0 link
 ```
 
-## Security
-
-- **No Leaks**: iptables default DROP policy
-- **VPN-Only**: USB traffic can ONLY exit through `tailscale0` or `tun0`
-- **Kill Switch**: Automatic blocking when VPNs are down
-- **Split Routing**: Prevents lockout while securing clients
-
-## Supported Devices
-
-- Orange Pi Zero/One/PC
-- Orange Pi 4 LTS (RK3399 with USB-C)
-- Raspberry Pi Zero W/2W (USB gadget capable)
-- Any Linux SBC with USB OTG support
-
 ### Orange Pi Zero Pinout Reference
+![Orange Pi Zero USB VPN Router Setup](images/orangepi-zero-setup.webp)
 ![Orange Pi Zero Pinout](images/pinout.webp)
 
 **Connection Notes:**
 - Use the micro-USB port (not the USB-A port) for gadget mode
 - UART pins for console access: TX (pin 8), RX (pin 10), GND (pin 6)
 - Power can be supplied through micro-USB or GPIO pins
+
 
 ### Orange Pi 4 LTS
 
