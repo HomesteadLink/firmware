@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
-# leak-test.sh — Consolidated IPv4/IPv6 DNS and egress leak checks (macOS-friendly)
+#!/bin/bash
+# leak-test.sh  Consolidated IPv4/IPv6 DNS and egress leak checks (macOS-friendly)
 #
 # Features
 # - Resolver check (dig) to detect DNS leak vs expected router DNS (default 192.168.64.1)
 # - IPv4 egress via DNS-only (OpenDNS/Google) and via HTTPS API (ifconfig.co/json over IPv4)
 # - IPv6 egress test via HTTPS API (ifconfig.co/json over IPv6)
-#   • If IPv6 is disabled/unavailable, treated as OK (no leak)
+#    If IPv6 is disabled/unavailable, treated as OK (no leak)
 # - Country checks (Team Cymru + countries.nerd.dk for IPv4; ifconfig.co country_iso for v4/v6)
 # - Clear summary and exit codes: 0 OK, 2 potential leak
 #
@@ -61,8 +61,8 @@ need curl
 
 hr() { printf '%*s\n' "${1:-60}" '' | tr ' ' '-'; }
 
-# Wrapper for dig with timeouts
-digx() { dig +time=$TIMEOUT +tries=1 "$@"; }
+# Wrapper for dig with timeouts (never fail hard)
+digx() { dig +time=$TIMEOUT +tries=1 "$@" || true; }
 
 # Resolver used by dig (SERVER line)
 resolver_used() {
@@ -77,7 +77,7 @@ resolver_used() {
 ipv4_public_dns() {
   local ip
   ip=$(digx +short myip.opendns.com @resolver1.opendns.com | tail -n1 || true)
-  if ! printf "%s" "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+  if ! printf "%s\n" "$ip" | awk -F. 'NF==4{ok=1; for(i=1;i<=4;i++){ if($i!~/^[0-9]+$/||$i<0||$i>255){ok=0} } } END{exit ok?0:1}'; then
     ip=$(digx +short TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '"' | tail -n1 || true)
   fi
   printf "%s\n" "$ip"
@@ -87,6 +87,36 @@ ipv4_public_dns() {
 ipv4_cymru_line() { digx +short -t txt "$1".origin.asn.cymru.com | tr -d '"'; }
 ipv4_cymru_cc()   { ipv4_cymru_line "$1" | awk -F'|' '{gsub(/ /,"",$0); print $4}'; }
 ipv4_nerddk_cc()  { digx +short "$1".country.zz.countries.nerd.dk | tr -d '"'; }
+
+# GeoIP country lookup: prefers local MaxMind DB via mmdblookup, falls back to HTTP APIs
+geo_cc_mmdb() {
+  local ip="$1" db cc
+  for db in \
+    /usr/local/share/GeoIP/GeoLite2-Country.mmdb \
+    /usr/share/GeoIP/GeoLite2-Country.mmdb \
+    /opt/homebrew/var/GeoIP/GeoLite2-Country.mmdb; do
+    [ -r "$db" ] || continue
+    cc=$(mmdblookup --file "$db" --ip "$ip" country iso_code 2>/dev/null | awk -F '"' '/"[A-Z][A-Z]"/{print $2; exit}')
+    if [ -n "$cc" ]; then printf "%s\n" "$cc"; return 0; fi
+  done
+  return 1
+}
+
+geo_cc_http() {
+  local ip="$1" cc
+  cc=$(curl -fsS --max-time "$CURL_MAXTIME" "https://ipinfo.io/$ip/country" 2>/dev/null | tr -d '\r\n') || true
+  if [ -n "$cc" ] && [ ${#cc} -le 3 ]; then printf "%s\n" "$cc"; return 0; fi
+  cc=$(curl -fsS --max-time "$CURL_MAXTIME" "https://ipapi.co/$ip/country/" 2>/dev/null | tr -d '\r\n') || true
+  if [ -n "$cc" ]; then printf "%s\n" "$cc"; return 0; fi
+  return 1
+}
+
+geo_cc() {
+  local ip="$1" cc=""
+  if command -v mmdblookup >/dev/null 2>&1; then cc=$(geo_cc_mmdb "$ip" || true); fi
+  if [ -z "$cc" ]; then cc=$(geo_cc_http "$ip" || true); fi
+  printf "%s\n" "$cc"
+}
 
 # CHAOS TXT from router (dnsmasq often responds)
 dnsmasq_chaos() {
@@ -103,101 +133,109 @@ odns_dbg() { digx +short TXT debug.opendns.com @resolver1.opendns.com | tr -d '"
 # ifconfig.co/json helpers (no jq)
 json_field() { # json_field <key> ; reads JSON on stdin, extracts first string value for key
   local key="$1"
-  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^"]*\)\".*/\1/p" | head -n1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
 }
 
 ifconfig_v4() { curl -4 -fsS --max-time "$CURL_MAXTIME" https://ifconfig.co/json 2>/dev/null || true; }
 ifconfig_v6() { curl -6 -fsS --max-time "$CURL_MAXTIME" https://ifconfig.co/json 2>/dev/null || true; }
 
 main() {
-  echo -e "${CYAN}Consolidated Leak Test (IPv4/IPv6)${NC}"
+  # Print title without parentheses to avoid any exotic parsing issues
+  printf "%b" "$CYAN"
+  printf "Consolidated Leak Test IPv4/IPv6\n"
+  printf "%b" "$NC"
   hr 60
-  echo "Expected router DNS: $ROUTER_DNS"
-  [ -n "$EXPECT_COUNTRY" ] && echo "Expected egress country: $EXPECT_COUNTRY"
-  echo
+  printf "Expected router DNS: %s\n" "$ROUTER_DNS"
+  if [ -n "$EXPECT_COUNTRY" ]; then printf "Expected egress country: %s\n" "$EXPECT_COUNTRY"; fi
+  printf "\n"
 
   # [1] Resolver check
-  echo "[1/6] DNS resolver used by this host (dig stats)"
+  printf "[1/6] DNS resolver used by this host (dig stats)\n"
   local used_resolver leak_dns=0
   used_resolver=$(resolver_used)
-  echo "Resolver used: ${used_resolver:-unknown}"
+  printf "Resolver used: %s\n" "${used_resolver:-unknown}"
   if [ -n "$used_resolver" ] && [ -n "$ROUTER_DNS" ] && [ "$used_resolver" != "$ROUTER_DNS" ]; then
-    echo -e "${RED}WARNING:${NC} Queries appear to bypass $ROUTER_DNS"
+    printf "%bWARNING:%b Queries appear to bypass %s\n" "$RED" "$NC" "$ROUTER_DNS"
     leak_dns=1
   else
-    echo -e "${GREEN}OK:${NC} Resolver matches expected (or unknown)"
+    printf "%bOK:%b Resolver matches expected (or unknown)\n" "$GREEN" "$NC"
   fi
-  echo
+  printf "\n"
 
   # [2] Router CHAOS TXT
-  echo "[2/6] Router CHAOS TXT (dnsmasq hint)"
-  echo "CHAOS @${ROUTER_DNS}: $(dnsmasq_chaos)"
-  echo
+  printf "[2/6] Router CHAOS TXT (dnsmasq hint)\n"
+  chaos_val="$(dnsmasq_chaos)"
+  printf "CHAOS @%s: %s\n" "$ROUTER_DNS" "$chaos_val"
+  printf "\n"
 
   # [3] IPv4 egress via DNS-only + Geo
-  echo "[3/6] IPv4 public IP via DNS-only and Geo"
+  printf "[3/6] IPv4 public IP via DNS-only and Geo\n"
   local v4_ip v4_cymru v4_cc_cymru v4_cc_nerd
   v4_ip=$(ipv4_public_dns)
-  if printf "%s" "$v4_ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
-    echo "IPv4 (DNS): $v4_ip"
+  if printf "%s\n" "$v4_ip" | awk -F. 'NF==4{ok=1; for(i=1;i<=4;i++){ if($i!~/^[0-9]+$/||$i<0||$i>255){ok=0} } } END{exit ok?0:1}'; then
+    printf "IPv4 (DNS): %s\n" "$v4_ip"
     v4_cymru=$(ipv4_cymru_line "$v4_ip")
     v4_cc_cymru=$(ipv4_cymru_cc "$v4_ip")
     v4_cc_nerd=$(ipv4_nerddk_cc "$v4_ip")
-    echo "Team Cymru: ${v4_cymru:-n/a}"
-    echo "Country (Cymru): ${v4_cc_cymru:-n/a}"
-    echo "Country (nerd.dk): ${v4_cc_nerd:-n/a}"
+    v4_cc_geo=$(geo_cc "$v4_ip")
+    printf "Team Cymru: %s\n" "${v4_cymru:-n/a}"
+    printf "Country (Cymru): %s\n" "${v4_cc_cymru:-n/a}"
+    printf "Country (nerd.dk): %s\n" "${v4_cc_nerd:-n/a}"
+    if [ -n "${v4_cc_geo:-}" ]; then printf "Country (GeoIP): %s\n" "${v4_cc_geo}"; fi
   else
-    echo -e "${YELLOW}NOTE:${NC} Could not obtain IPv4 via DNS-only"
+    printf "%bNOTE:%b Could not obtain IPv4 via DNS-only\n" "$YELLOW" "$NC"
   fi
-  echo
+  printf "\n"
 
   # [4] IPv4 via HTTPS API (ifconfig.co/json)
-  echo "[4/6] IPv4 egress via ifconfig.co/json"
+  printf "[4/6] IPv4 egress via ifconfig.co/json\n"
   local v4_json v4_api_ip v4_api_cc
   v4_json=$(ifconfig_v4)
   if [ -n "$v4_json" ]; then
     v4_api_ip=$(printf "%s" "$v4_json" | json_field ip)
     v4_api_cc=$(printf "%s" "$v4_json" | json_field country_iso)
-    echo "IPv4 API IP: ${v4_api_ip:-n/a}"
-    echo "IPv4 API Country: ${v4_api_cc:-n/a}"
+    printf "IPv4 API IP: %s\n" "${v4_api_ip:-n/a}"
+    printf "IPv4 API Country: %s\n" "${v4_api_cc:-n/a}"
   else
-    echo -e "${YELLOW}NOTE:${NC} IPv4 API request failed"
+    printf "%bNOTE:%b IPv4 API request failed\n" "$YELLOW" "$NC"
   fi
-  echo
+  printf "\n"
 
   # [5] IPv6 egress via ifconfig.co/json (treat unavailable as OK)
-  echo "[5/6] IPv6 egress (ifconfig.co/json over IPv6)"
+  printf "[5/6] IPv6 egress (ifconfig.co/json over IPv6)\n"
   local v6_json v6_api_ip v6_api_cc v6_available=0
   v6_json=$(ifconfig_v6)
   if [ -n "$v6_json" ]; then
     v6_api_ip=$(printf "%s" "$v6_json" | json_field ip)
     v6_api_cc=$(printf "%s" "$v6_json" | json_field country_iso)
     if [ -n "$v6_api_ip" ]; then v6_available=1; fi
-    echo "IPv6 API IP: ${v6_api_ip:-n/a}"
-    echo "IPv6 API Country: ${v6_api_cc:-n/a}"
+    printf "IPv6 API IP: %s\n" "${v6_api_ip:-n/a}"
+    printf "IPv6 API Country: %s\n" "${v6_api_cc:-n/a}"
   else
-    echo "IPv6 appears unavailable (no response over v6) — treated as OK"
+    printf "IPv6 appears unavailable (no response over v6)  treated as OK\n"
   fi
-  echo
+  printf "\n"
 
   # [6] Resolver POP hints
-  echo "[6/6] Resolver POP hints"
-  echo "Cloudflare id.server @1.1.1.1 | @1.0.0.1: $(cf_pop)"
-  echo "OpenDNS debug: $(odns_dbg)"
-  echo
+  printf "[6/6] Resolver POP hints\n"
+  cf_line="$(cf_pop)"
+  odns_line="$(odns_dbg)"
+  printf "Cloudflare id.server @1.1.1.1 | @1.0.0.1: %s\n" "$cf_line"
+  printf "OpenDNS debug: %s\n" "$odns_line"
+  printf "\n"
 
   # Summary
   hr 60
-  echo "Summary:"
-  echo "  Resolver used: ${used_resolver:-unknown} (expected: $ROUTER_DNS)"
-  [ -n "${v4_ip:-}" ] && echo "  IPv4 (DNS) IP: $v4_ip | CC: ${v4_cc_cymru:-?}/${v4_cc_nerd:-?}"
-  [ -n "${v4_api_ip:-}" ] && echo "  IPv4 (API) IP: $v4_api_ip | CC: ${v4_api_cc:-?}"
+  printf "Summary:\n"
+  printf "  Resolver used: %s (expected: %s)\n" "${used_resolver:-unknown}" "$ROUTER_DNS"
+  if [ -n "${v4_ip:-}" ]; then printf "  IPv4 (DNS) IP: %s | CC: %s/%s | GeoIP: %s\n" "$v4_ip" "${v4_cc_cymru:-?}" "${v4_cc_nerd:-?}" "${v4_cc_geo:-?}"; fi
+  if [ -n "${v4_api_ip:-}" ]; then printf "  IPv4 (API) IP: %s | CC: %s\n" "${v4_api_ip:-}" "${v4_api_cc:-?}"; fi
   if [ "$v6_available" -eq 1 ]; then
-    echo "  IPv6 (API) IP: ${v6_api_ip:-?} | CC: ${v6_api_cc:-?}"
+    printf "  IPv6 (API) IP: %s | CC: %s\n" "${v6_api_ip:-?}" "${v6_api_cc:-?}"
   else
-    echo "  IPv6: unavailable/disabled (OK)"
+    printf "  IPv6: unavailable/disabled (OK)\n"
   fi
-  [ -n "$EXPECT_COUNTRY" ] && echo "  Expected country: $EXPECT_COUNTRY"
+  if [ -n "$EXPECT_COUNTRY" ]; then printf "  Expected country: %s\n" "$EXPECT_COUNTRY"; fi
 
   local exit_code=0
   # DNS leak if resolver bypasses router
@@ -208,20 +246,20 @@ main() {
     # Consider a mismatch only if both independent sources (Cymru & nerd.dk) disagree
     if [ -n "${v4_cc_cymru:-}" ] || [ -n "${v4_cc_nerd:-}" ]; then
       if [ "${v4_cc_cymru:-X}" != "$EXPECT_COUNTRY" ] && [ "${v4_cc_nerd:-X}" != "$EXPECT_COUNTRY" ]; then
-        echo -e "${YELLOW}NOTE:${NC} IPv4 egress country differs from expectation"
+        printf "%bNOTE:%b IPv4 egress country differs from expectation\n" "$YELLOW" "$NC"
       fi
     fi
     # IPv6: only enforce if IPv6 is actually available
     if [ "$v6_available" -eq 1 ] && [ -n "${v6_api_cc:-}" ] && [ "$v6_api_cc" != "$EXPECT_COUNTRY" ]; then
-      echo -e "${RED}WARNING:${NC} IPv6 egress country differs from expectation — possible IPv6 leak"
+      printf "%bWARNING:%b IPv6 egress country differs from expectation  possible IPv6 leak\n" "$RED" "$NC"
       exit_code=2
     fi
   fi
 
   if [ "$exit_code" -eq 0 ]; then
-    echo -e "${GREEN}No leaks detected${NC} (resolver OK; IPv6 disabled or matches expectations)"
+    printf "%bNo leaks detected%b (resolver OK; IPv6 disabled or matches expectations)\n" "$GREEN" "$NC"
   else
-    echo -e "${RED}Potential leak detected${NC} — see warnings above"
+    printf "%bPotential leak detected%b  see warnings above\n" "$RED" "$NC"
   fi
   exit "$exit_code"
 }
