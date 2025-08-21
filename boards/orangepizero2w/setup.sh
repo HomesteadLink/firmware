@@ -151,7 +151,7 @@ echo 0x0104 > idProduct
 mkdir -p strings/0x409
 echo "SteadyLink"      > strings/0x409/manufacturer
 echo "RNDIS/Ethernet Gadget" > strings/0x409/product
-echo "0001"         > strings/0x409/serialnumber
+echo "9810"         > strings/0x409/serialnumber
 mkdir -p configs/c.1/strings/0x409
 echo "ACM+ECM+RNDIS" > configs/c.1/strings/0x409/configuration
 mkdir -p functions/acm.usb0

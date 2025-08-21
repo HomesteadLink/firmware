@@ -20,6 +20,9 @@ TAILSCALE_INTERFACE="tailscale0"
 OPENVPN_INTERFACE="tun0"
 USE_TAILSCALE_EXIT="${USE_TAILSCALE_EXIT:-true}"  # Default: route through VPN only
 USE_VPN_FAILOVER="${USE_VPN_FAILOVER:-true}"  # Enable automatic VPN failover
+# IPv6 settings for USB segment (ULA prefix)
+USB_IPV6_ADDR="fd00:64::1"
+USB_IPV6_PREFIX="fd00:64::/64"
 
 # Colors for output
 RED='\033[0;31m'
@@ -290,6 +293,7 @@ Name=usb*
 
 [Network]
 Address=$USB_IP/24
+# Address=${USB_IPV6_ADDR}/64
 ConfigureWithoutCarrier=yes
 
 [Link]
@@ -358,6 +362,12 @@ cache-size=150
 domain-needed
 bogus-priv
 
+# IPv6 Router Advertisements for USB (ULA prefix)
+# enable-ra
+# dhcp-range=${USB_IPV6_PREFIX},ra-stateless,ra-names,64
+# Optional: advertise DNS over IPv6 as the gadget itself
+# dhcp-option=option6:dns-server,${USB_IPV6_ADDR}
+
 # Logging
 log-dhcp
 log-queries
@@ -388,7 +398,7 @@ setup_nat() {
     # Enable IP forwarding (IPv4 and IPv6) in one place
     cat > /etc/sysctl.d/30-ip-forward.conf << EOF
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.all.forwarding=0
 EOF
     sysctl -p /etc/sysctl.d/30-ip-forward.conf
     
@@ -413,6 +423,14 @@ table ip usb_router_nat {
     type nat hook postrouting priority 100;
     ip saddr ${USB_NETWORK} oifname "${TAILSCALE_INTERFACE}" masquerade
     ip saddr ${USB_NETWORK} oifname "${OPENVPN_INTERFACE}" masquerade
+  }
+}
+
+table ip6 usb_router_nat6 {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    ip6 saddr ${USB_IPV6_PREFIX} oifname "${TAILSCALE_INTERFACE}" masquerade
+    ip6 saddr ${USB_IPV6_PREFIX} oifname "${OPENVPN_INTERFACE}" masquerade
   }
 }
 EOF
