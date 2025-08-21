@@ -149,18 +149,28 @@ cd "$G"
 echo 0x1d6b > idVendor
 echo 0x0104 > idProduct
 mkdir -p strings/0x409
-echo "OrangePi"      > strings/0x409/manufacturer
-echo "Zero2W Gadget" > strings/0x409/product
+echo "SteadyLink"      > strings/0x409/manufacturer
+echo "RNDIS/Ethernet Gadget" > strings/0x409/product
 echo "0001"         > strings/0x409/serialnumber
 mkdir -p configs/c.1/strings/0x409
-echo "ACM+ECM" > configs/c.1/strings/0x409/configuration
+echo "ACM+ECM+RNDIS" > configs/c.1/strings/0x409/configuration
 mkdir -p functions/acm.usb0
 mkdir -p functions/ecm.usb0
+mkdir -p functions/rndis.usb0
 # Optional MACs can be provided via environment
 [ -n "$DEV_MAC" ]  && echo "$DEV_MAC"  > functions/ecm.usb0/dev_addr || true
 [ -n "$HOST_MAC" ] && echo "$HOST_MAC" > functions/ecm.usb0/host_addr || true
+[ -n "$DEV_MAC" ]  && echo "$DEV_MAC"  > functions/rndis.usb0/dev_addr || true
+[ -n "$HOST_MAC" ] && echo "$HOST_MAC" > functions/rndis.usb0/host_addr || true
 ln -sf functions/acm.usb0 configs/c.1/
 ln -sf functions/ecm.usb0 configs/c.1/
+ln -sf functions/rndis.usb0 configs/c.1/
+# Enable Microsoft OS descriptors for better Windows RNDIS support
+mkdir -p os_desc
+echo 1 > os_desc/use
+echo MSFT100 > os_desc/qw_sign
+echo 0x01 > os_desc/b_vendor_code
+ln -sf configs/c.1 os_desc
 UDC=$(ls /sys/class/udc 2>/dev/null | head -n1 || true)
 [ -n "$UDC" ] && echo "$UDC" > UDC || true
 # Bring up usb0 with STATIC_IP if present
@@ -175,7 +185,7 @@ EOSH
   mkdir -p /etc/systemd/system
   cat >/etc/systemd/system/usb-gadget.service <<'EOF'
 [Unit]
-Description=USB Gadget (ACM + ECM) bringup
+Description=USB Gadget (ACM + ECM + RNDIS) bringup
 DefaultDependencies=no
 After=local-fs.target
 Before=sysinit.target
