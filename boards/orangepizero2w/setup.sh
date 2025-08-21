@@ -150,7 +150,7 @@ echo 0x1d6b > idVendor
 echo 0x0104 > idProduct
 mkdir -p strings/0x409
 echo "SteadyLink"      > strings/0x409/manufacturer
-echo "RNDIS/Ethernet Gadget" > strings/0x409/product
+echo "USB 10/100/1000 LAN" > strings/0x409/product
 echo "9810"         > strings/0x409/serialnumber
 mkdir -p configs/c.1/strings/0x409
 echo "ACM+ECM+RNDIS" > configs/c.1/strings/0x409/configuration
