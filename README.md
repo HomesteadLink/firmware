@@ -3,6 +3,8 @@
 ![](./images/concept1.webp)
 ![](./images/routing.webp)
 
+[ORDER ONLINE](https://homesteadlink.netlify.app/)
+
 ## **Who it’s for (ICP) and core value**
 
 - **ICP**: Digital nomads, founders, traders, streamers, journalists, ad buyers, QA teams, remote employees needing “home-like” IP.
