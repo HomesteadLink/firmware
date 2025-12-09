@@ -1,4 +1,4 @@
-# USB VPN Router
+# Type-C USB Resedential VPN Router
 
 ![](./images/concept1.webp)
 ![](./images/routing.webp)
