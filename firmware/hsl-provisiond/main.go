@@ -463,27 +463,52 @@ var (
 	btDead   bool
 )
 
-// bootRecovery implements the §F4 crash rules + the critique-round
-// rule that a staged VPN config is never silently lost:
+// bootRecovery implements the §F4 crash rules + the round-8 crash
+// rule (B2):
 //   - candidate/wifi.conf is discarded (the device boots the
 //     committed config or stays unconfigured — never half-applied);
-//   - a candidate/vpn.conf staged before the crash is COMMITTED if it
-//     validates (the user's VPN intent survives; the next join/boot
-//     raises it), or discarded loudly with the failure surfaced in
-//     the initial Status error if it does not;
+//   - PROMOTION BRANCH: a candidate/vpn.conf whose transaction had
+//     PASSED the wifi commit point (persisted tx_phase "committed"
+//     or "vpn", committed wifi.conf present) is PROMOTED to the
+//     committed vpn.conf — as committed-but-down (DL43): the boot
+//     rejoin raises it and lands online or vpn_failed. It is never
+//     deleted.
+//   - a candidate/vpn.conf from a transaction that never reached
+//     the wifi commit point is discarded with the transaction
+//     (loudly journal-logged, fingerprint only);
+//   - an invalid candidate/vpn.conf is discarded loudly and the
+//     failure is surfaced in the initial Status error;
 //   - live/ is re-rendered from committed; tx_phase resets.
+//
+// The promotion branch is exactly why the transaction phase is
+// persisted in state.json: §F4's crash/restart rule mandates it
+// ("the transaction phase is persisted in state.json on every phase
+// change; if the commit rename already happened, finish the apply
+// from committed"). Without the persisted phase, "passed the wifi
+// commit point" is unknowable at boot.
 func bootRecovery() {
-	if phase := store.getTxPhase(); phase != "" && phase != "committed" && phase != "rolledback" {
+	phase := store.getTxPhase()
+	if phase != "" && phase != "committed" && phase != "rolledback" {
 		log.Printf("boot recovery: transaction interrupted in phase %q — discarding candidate wifi, booting committed config", phase)
 	}
 	if b, err := os.ReadFile(vpnCandPath); err == nil {
-		if _, code := validateVpnPayload(b); code == "" {
-			if err := writeFileAtomic(vpnPath, b, 0o600); err == nil {
-				log.Printf("boot recovery: staged candidate vpn.conf committed (crash between wifi and vpn commit must not lose the user's VPN config)")
-			}
-		} else {
+		_, code := validateVpnPayload(b)
+		switch {
+		case code != "":
 			log.Printf("boot recovery: staged candidate vpn.conf INVALID (%s) — discarding, surfaced as Status error", code)
 			store.update(func(s *State) { s.Error = code })
+		case (phase == "committed" || phase == "vpn") && hasWifiConfig():
+			// Promotion: the wifi commit point had passed, so the
+			// staged VPN belongs to a committed transaction.
+			if err := writeFileAtomic(vpnPath, b, 0o600); err == nil {
+				log.Printf("boot recovery: candidate vpn.conf PROMOTED to committed-but-down (transaction had passed the wifi commit point, phase=%q)", phase)
+			}
+		default:
+			var v VpnConfigPayload
+			if json.Unmarshal(b, &v) == nil && v.Type == "tailscale" {
+				fingerprint("discarded pre-commit staged tailscale authkey", v.AuthKey)
+			}
+			log.Printf("boot recovery: staged candidate vpn.conf discarded — its transaction never reached the wifi commit point (phase=%q)", phase)
 		}
 	}
 	_ = os.RemoveAll(candidateDir)

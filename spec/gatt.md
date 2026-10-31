@@ -54,9 +54,12 @@ Senders must not emit fields with types other than those specified.
   failure; remaining durations are counted down while powered,
   persisted on every failure and at least every 10 s, and resumed at
   startup; powered-off time does not count down. 5 failures inside
-  one window → the window closes immediately, the failure count
-  resets, and bonding locks out for 15 min of powered time, doubled
-  per lockout (30 min, cap 60 min). After a lockout expires, 5 fresh
+  one window → the FAILURE window closes immediately, the failure
+  count resets, and bonding locks out for 15 min of powered time,
+  doubled per lockout (30 min, cap 60 min). The lockout throttles
+  pairing attempts only: it never closes the provisioning window —
+  advertising, discoverability and pairability are governed solely
+  by the provisioning-window rules below. After a lockout expires, 5 fresh
   failures are required for the next lockout, but the lockout count
   PERSISTS (so the next lockout is longer); it resets to 0 only on a
   successful bond or a factory reset. Applies in the 300 s boot

@@ -298,6 +298,13 @@ mkdir -p "$PAY/var/log/journal"
 # package payload (debugfs mode) joins the same staging tree
 if [ "$MODE" = "debugfs" ]; then
   ( cd "$STAGE" && tar cf - . ) | ( cd "$PAY" && tar xf - )
+  # The nftables and hostapd debs ship their OWN /etc/nftables.conf
+  # and /etc/hostapd/hostapd.conf — the tar merge just overwrote
+  # ours. Re-stage both AFTER the merge so the shipped files are
+  # the §F4 ruleset and the §F1 hostapd template, never the stock
+  # skeletons (caught by artifact content verification, 2026-11-01).
+  stage_file "$FW/configs/nftables.conf" /etc/nftables.conf 644
+  stage_file "$FW/configs/hostapd-homesteadlink.conf" /etc/hostapd/hostapd.conf 644
   stage_file "$WORK/dpkg-status.new" /var/lib/dpkg/status 644
 fi
 
@@ -375,6 +382,14 @@ else
   debugfs -R "dump /etc/bluetooth/main.conf $WORK/main.conf.final" "$ROOTPART_IMG" >/dev/null 2>&1 || true
   grep -q "^ControllerMode" "$WORK/main.conf.final" || fail "bluetooth main.conf assertion: no uncommented ControllerMode (F14)"
   grep -q "^Name" "$WORK/main.conf.final" && fail "bluetooth main.conf assertion: Name= present (F14)"
+  # Content assertions: the shipped ruleset must be OURS (hsl_filter,
+  # policy drop), not the nftables deb's stock skeleton; the shipped
+  # hostapd.conf must be the §F1 template (placeholder passphrase).
+  debugfs -R "dump /etc/nftables.conf $WORK/nftables.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final nftables.conf"
+  grep -q "hsl_filter" "$WORK/nftables.final" || fail "nftables assertion: shipped /etc/nftables.conf is not the §F4 ruleset (stock skeleton?)"
+  grep -q "policy drop" "$WORK/nftables.final" || fail "nftables assertion: no policy drop in shipped ruleset"
+  debugfs -R "dump /etc/hostapd/hostapd.conf $WORK/hostapd.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final hostapd.conf"
+  grep -q "AP_PASSPHRASE_FROM_IDENTITY" "$WORK/hostapd.final" || fail "hostapd assertion: shipped /etc/hostapd/hostapd.conf is not the §F1 template"
   log "artifact assertions passed (dpkg set: $ASSERT_PKGS; binaries; firmware; bluetooth conf)"
   dd if="$ROOTPART_IMG" of="$IMG" bs=512 seek="$PSTART" conv=notrunc status=none
   log "partition written back into image (debugfs mode)"

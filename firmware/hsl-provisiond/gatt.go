@@ -626,10 +626,15 @@ func recordPairingFailure() {
 	store.mu.Unlock()
 	store.persist()
 	if trigger {
-		log.Printf("pairing lockout: 5 failed attempts in the window — window closed, bonding locked for %d powered seconds (lockout #%d)", store.lk.LockoutRemainingS, store.lk.LockoutCount)
-		if gattSrv != nil {
-			gattSrv.CloseWindow()
-		}
+		// B1 (§F4 lockout/window separation, F7.8): the lockout
+		// throttles PAIRING ATTEMPTS ONLY — via pairingLockedOut()
+		// in the agent. It must NOT close the provisioning window:
+		// advertising, discoverability and pairability are governed
+		// exclusively by the window rules (owner close_window,
+		// online/online_no_vpn, 300 s/configured expiry). The
+		// "window" that closes here is the 60-minute FAILURE window,
+		// never the provisioning window.
+		log.Printf("pairing lockout: 5 failed attempts in the failure window — bonding locked for %d powered seconds (lockout #%d); provisioning window/advertising UNCHANGED", store.lk.LockoutRemainingS, store.lk.LockoutCount)
 	}
 }
 
@@ -769,10 +774,11 @@ func buildChars(s *gattServer) []*characteristic {
 				return nil, err
 			}
 			if isTxActive() {
-				// §F4: scan refused with error=busy mid-transaction;
-				// the read still returns the most recent value.
+				// §F4 (B3): a refused scan returns NO scan object —
+				// never the empty-scan object. The refusal is the
+				// error response + Status error=busy, nothing else.
 				store.update(func(st *State) { st.Error = "busy" })
-				return s.lastScanValue(), nil
+				return nil, dbus.NewError("org.bluez.Error.Failed", []interface{}{"scan refused: a join/VPN transaction is in progress (busy)"})
 			}
 			s.triggerScan()
 			return s.lastScanValue(), nil
