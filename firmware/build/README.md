@@ -37,4 +37,8 @@ sha256sum homesteadlink-orangepizero2w-<date>.img.xz   # compare with the publis
 2. `hsl-firstboot` writes `/etc/homesteadlink/identity.json` (serial + setup code).
 3. The device advertises as `HSL-<serial last4>` for 300 s (and permanently
    until Wi-Fi is configured). Provision from the app, or join the
-   `HomesteadLink-<last4>` AP and open `http://172.30.0.1:8080`.
+   `HomesteadLink-<last4>` AP and open `http://192.168.64.1:8080`
+   (usb0) or `http://192.168.65.1:8080` (AP mode). The AP passphrase
+   is an independent per-device secret in `identity.json`
+   (`ap_passphrase`, from /dev/urandom) — it is NOT derived from the
+   setup code or serial.

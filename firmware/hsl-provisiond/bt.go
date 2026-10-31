@@ -35,6 +35,14 @@ func btSupervision() {
 		if appeared {
 			continue
 		}
+		// GUARD (R3-1): never power-cycle the shared radio while the
+		// device is online — the cycle would drop the Wi-Fi uplink
+		// carrying client traffic. Retry later instead.
+		if st := store.get(); st.State == "online" || st.State == "online_no_vpn" {
+			log.Printf("hci0 absent but device is %s: skipping module power-cycle (router is carrying traffic)", st.State)
+			time.Sleep(15 * time.Second)
+			continue
+		}
 		if !cycled {
 			cycled = true
 			log.Printf("hci0 absent >30s: power-cycling module once and restarting hsl-bt-attach")
@@ -46,13 +54,8 @@ func btSupervision() {
 		if !btDead {
 			btDead = true
 			log.Printf("hci0 still absent after one power-cycle: error=bt_dead (router functions continue)")
-			st := store.get()
-			// bt_dead is a Status state in §F4 as well as an error tag.
-			if st.State == "idle" || st.State == "bt_dead" {
-				store.set("bt_dead", "bt_dead")
-			} else {
-				store.update(func(s *State) { s.Error = "bt_dead" })
-			}
+			// bt_dead is ERROR-ONLY (R3-1): never a Status state.
+			store.update(func(s *State) { s.Error = "bt_dead" })
 		}
 		time.Sleep(15 * time.Second)
 	}

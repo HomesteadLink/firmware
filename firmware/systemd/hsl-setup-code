@@ -1,0 +1,8 @@
+#!/bin/sh
+# hsl-setup-code (§F1): print serial + setup code over the serial console.
+ID=/etc/homesteadlink/identity.json
+[ -s "$ID" ] || { echo "no identity yet (hsl-firstboot has not run)"; exit 1; }
+SERIAL=$(sed -n 's/.*"serial":"\([^"]*\)".*/\1/p' "$ID" | head -1)
+CODE=$(sed -n 's/.*"setup_code":"\([^"]*\)".*/\1/p' "$ID" | head -1)
+AP_PASS=$(sed -n 's/.*"ap_passphrase":"\([^"]*\)".*/\1/p' "$ID" | head -1)
+echo "serial=$SERIAL setup_code=$CODE ap_passphrase=$AP_PASS"

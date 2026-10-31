@@ -1,0 +1,49 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * bt-uart — HomeSteadyLink §F2 Bluetooth UART overlay (F1 fix).
+ *
+ * Enables UART1 (serial@5000400, the UWE5622 module UART -> /dev/ttyS1)
+ * and adds its bluetooth child node.
+ *
+ * The bluetooth node's compatible string is copied from the vendor
+ * (Xunlong) DTS for this board family: the Allwinner vendor tree
+ * describes the UWE5622 BT low-power/wake node with compatible
+ * "allwinner,sunxi-btlpm" (the sprdbt path; see the Armbian forum
+ * record of the vendor DTS nodes for Orange Pi Zero 2, and §F2's
+ * "sprdbt compatible path as in the vendor DTS"). It is deliberately
+ * NOT an invented string. The runtime attach itself is userspace
+ * (hsl-bt-attach.service: btattach -B /dev/ttyS1 -P sprd per §F2);
+ * on-hardware verification of ttyS1 + the sprd protocol is the §F2
+ * F7.1 gate.
+ *
+ * When dtc is available the build compiles THIS file. On hosts
+ * without dtc, build/fdt_tools.py generates the equivalent .dtbo
+ * from the stock DTB (same nodes/properties).
+ */
+
+/ {
+	compatible = "allwinner,sun50i-h616", "allwinner,sun50i-h618";
+
+	fragment@0 {
+		target = <&uart1>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart1_pins>;
+
+			bluetooth {
+				compatible = "allwinner,sunxi-btlpm";
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/aliases";
+		__overlay__ {
+			serial1 = "/soc/serial@5000400";
+		};
+	};
+};

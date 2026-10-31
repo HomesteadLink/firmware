@@ -1,8 +1,10 @@
 [Unit]
 Description=HomeSteadyLink provisioning daemon (BLE GATT + Wi-Fi/VPN)
-After=bluetooth.service hsl-bt-attach.service hsl-firstboot.service network.target
-Wants=bluetooth.service hsl-firstboot.service
-Requires=hsl-bt-attach.service
+# §F2 service graph: After= only. provisiond must NOT Require
+# hsl-bt-attach or bluetooth — it starts without hci0 and serves the
+# config page / Wi-Fi apply path with BT dead (F8).
+After=bluetooth.service hsl-bt-attach.service hsl-firstboot.service network.target nftables.service
+Wants=bluetooth.service hsl-firstboot.service nftables.service
 
 [Service]
 Type=simple

@@ -1,0 +1,10 @@
+# §F4: systemd-networkd is the DHCP client for wlan0.
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=yes
+
+[DHCPv4]
+Hostname=HSL-XXXX
