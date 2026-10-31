@@ -1,6 +1,6 @@
 [Unit]
 Description=HomeSteadyLink first boot identity (serial + setup code)
-Before=hsl-provisiond.service
+Before=bluetooth.service hsl-provisiond.service serial-getty@ttyGS0.service
 After=local-fs.target
 
 [Service]

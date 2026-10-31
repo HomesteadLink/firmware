@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,14 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// VpnConfigPayload is the §F4 VpnConfig JSON schema (≤4096 B reassembled,
-// updated spec amendment 1).
+// VpnConfigPayload is the §F4 VpnConfig JSON schema (≤4096 B reassembled).
 type VpnConfigPayload struct {
 	Type     string `json:"type"` // "wireguard" | "tailscale"
 	Conf     string `json:"conf"` // wireguard: full wg-quick config text
@@ -113,13 +113,17 @@ func validateVpnPayload(payload []byte) (*VpnConfigPayload, string) {
 	return &v, ""
 }
 
-// applyVpnConfig persists a validated VpnConfig payload (0600). It does
-// NOT raise the VPN and never touches Status by itself (F2): the caller
-// decides whether the §F4 raise+validation may run.
-func applyVpnConfig(payload []byte) error {
+// stageVpnConfig is the ONE staging rule for every VpnConfig write
+// (GATT, config page, in-transaction or Device screen): validate →
+// write candidate/vpn.conf atomically. The caller decides the commit
+// point: outside a Wi-Fi transaction the stage commits immediately
+// (rename to committed vpn.conf); inside a transaction the file
+// stays candidate for the transaction's VPN phase (DL43/DL44).
+// Staging NEVER raises the VPN and never sets a terminal state.
+func stageVpnConfig(payload []byte) (*VpnConfigPayload, string) {
 	v, code := validateVpnPayload(payload)
 	if code != "" {
-		return fmt.Errorf("vpn config invalid: %s", code)
+		return nil, code
 	}
 	if v.Type == "wireguard" {
 		fingerprint("wireguard conf", v.Conf)
@@ -127,13 +131,16 @@ func applyVpnConfig(payload []byte) error {
 		fingerprint("tailscale authkey", v.AuthKey)
 	}
 	if err := writeFileAtomic(vpnCandPath, payload, 0o600); err != nil {
-		return err
+		return nil, "vpn_config_invalid"
 	}
-	if err := os.Rename(vpnCandPath, vpnPath); err != nil {
-		return err
-	}
-	renderLiveFromCommitted()
-	return nil
+	return v, ""
+}
+
+// commitStagedVpnNow commits a staged candidate immediately (the
+// Device-screen / no-transaction path).
+func commitStagedVpnNow() {
+	commitStagedVPN()
+	log.Printf("vpn config staged and committed (no raise — takes effect on vpn_start or the next join sequence)")
 }
 
 // wifiOnline reports whether Wi-Fi is joined with a lease — the
@@ -143,73 +150,91 @@ func wifiOnline() bool {
 	return st.SSID != "" && st.IP4 != ""
 }
 
-// raiseAndValidateVPN is the only path that may set `online` (§F4):
-// raise, then prove the tunnel — WireGuard handshake ≤20 s + default
-// route via wg-hsl, or Tailscale BackendState=Running + netcheck UDP.
-// Failure lands in state vpn_failed with the paired error.
-func raiseAndValidateVPN() error {
+// verifyKillSwitch (§F4/§F8 item 10): the merged ruleset is installed
+// at /etc/nftables.conf and loaded by nftables.service. provisiond
+// loads NO table of its own — it only verifies that inet hsl_filter
+// exists before any VPN raise, and refuses (fail closed) otherwise.
+func verifyKillSwitch() error {
+	out, err := exec.Command("nft", "list", "table", "inet", "hsl_filter").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft list table inet hsl_filter: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// raiseAndValidateVPN raises the given config and proves the tunnel
+// before publishing `online` (§F4 commit checks): WireGuard =
+// handshake within 30 s + default route via wg-hsl; Tailscale =
+// BackendState=Running + netcheck UDP within 30 s, and when an exit
+// node is set, `tailscale ping <exit_node>` must succeed. EVERY
+// failure lands in state vpn_failed with the paired error — never
+// idle (critique f2). Success is the only path to `online`.
+func raiseAndValidateVPN(v *VpnConfigPayload) error {
+	fail := func(code string, err error) error {
+		store.set("vpn_failed", code)
+		log.Printf("vpn raise/validation failed (%s): %v", code, err)
+		return err
+	}
 	if !wifiOnline() {
 		return fmt.Errorf("wifi not online; vpn raise deferred")
 	}
-	if err := applyKillSwitch(); err != nil {
-		store.set("vpn_failed", "vpn_failed")
-		return fmt.Errorf("kill switch not in place, refusing vpn raise: %w", err)
-	}
-	v, err := loadVPN()
-	if err != nil {
-		return fmt.Errorf("no vpn config stored: %w", err)
+	if err := verifyKillSwitch(); err != nil {
+		return fail("vpn_failed", fmt.Errorf("kill switch not in place, refusing vpn raise: %w", err))
 	}
 	store.set("vpn_starting", "")
 	switch v.Type {
 	case "wireguard":
 		if err := writeFileAtomic(wgConfigPath, []byte(v.Conf), 0o600); err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return err
+			return fail("vpn_failed", err)
 		}
 		out, err := exec.Command("systemctl", "start", "wg-quick@wg-hsl.service").CombinedOutput()
 		if err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return fmt.Errorf("wg-quick@wg-hsl start: %v: %s", err, strings.TrimSpace(string(out)))
+			return fail("vpn_failed", fmt.Errorf("wg-quick@wg-hsl start: %v: %s", err, strings.TrimSpace(string(out))))
 		}
-		if err := waitWGHandshake(20 * time.Second); err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return err
+		if err := waitWGHandshake(30 * time.Second); err != nil {
+			return fail("vpn_failed", err)
 		}
 		if !defaultRouteVia("wg-hsl") {
-			store.set("vpn_failed", "vpn_failed")
-			return fmt.Errorf("no default route via wg-hsl after raise")
-		}
-		// R3-2: an actual ping THROUGH the tunnel gates `online`,
-		// not just handshake recency + route presence.
-		if err := pingThroughTunnel("wg-hsl", wgDNS(v.Conf)); err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return fmt.Errorf("tunnel ping failed: %w", err)
+			return fail("vpn_failed", fmt.Errorf("no default route via wg-hsl after raise"))
 		}
 		setDNSUpstream(wgDNS(v.Conf))
 	case "tailscale":
 		// Auth key via a 0600 file (file: scheme), never argv (F19).
 		keyFile := cfgDir + "/.ts-authkey"
 		if err := writeFileAtomic(keyFile, []byte(v.AuthKey), 0o600); err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return err
+			return fail("vpn_failed", err)
 		}
 		defer os.Remove(keyFile)
-		args := []string{"up", "--authkey", "file:" + keyFile, "--accept-dns=false"} // R3-2: dnsmasq owns DNS (server=100.100.100.100); tailscale must not take over DNS
+		// --accept-dns=false (§F4): dnsmasq is the ONE DNS owner.
+		args := []string{"up", "--authkey", "file:" + keyFile, "--accept-dns=false"}
 		if v.ExitNode != "" {
 			args = append(args, "--exit-node", v.ExitNode)
 		}
 		fingerprint("tailscale authkey", v.AuthKey)
-		if _, err := exec.Command("tailscale", args...).CombinedOutput(); err != nil {
-			store.set("vpn_failed", "vpn_failed")
-			return fmt.Errorf("tailscale up failed: %v", err)
+		if out, err := exec.Command("tailscale", args...).CombinedOutput(); err != nil {
+			return fail("vpn_failed", fmt.Errorf("tailscale up failed: %v: %s", err, strings.TrimSpace(string(out))))
 		}
-		if err := waitTailscaleRunning(20 * time.Second); err != nil {
+		if err := waitTailscaleRunning(30 * time.Second); err != nil {
 			code := "vpn_failed"
 			if tailscaleKeyExpired() {
 				code = "authkey_expired"
 			}
-			store.set("vpn_failed", code)
-			return fmt.Errorf("tailscale validation: %v", err)
+			if !ntpSynchronized() {
+				// §F4 clock rule: name the clock in the journal when a
+				// Tailscale failure coincides with an unsynced clock.
+				log.Printf("tailscale validation failed while the clock is NOT NTPSynchronized — TLS/clock is a likely cause (board has no RTC)")
+			}
+			return fail(code, fmt.Errorf("tailscale validation: %v", err))
+		}
+		if v.ExitNode != "" {
+			// Exit-node liveness (§F4): a Running backend with a dead
+			// exit node is vpn_failed, not online.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			out, err := exec.CommandContext(ctx, "tailscale", "ping", v.ExitNode).CombinedOutput()
+			cancel()
+			if err != nil {
+				return fail("vpn_failed", fmt.Errorf("tailscale ping exit node %s: %v: %s", v.ExitNode, err, strings.TrimSpace(string(out))))
+			}
 		}
 		setDNSUpstream("100.100.100.100")
 	}
@@ -219,17 +244,13 @@ func raiseAndValidateVPN() error {
 	return nil
 }
 
-// pingThroughTunnel sends ICMP through the tunnel interface to the
-// config's DNS resolver (or 1.1.1.1) — proof of end-to-end forwarding.
-func pingThroughTunnel(iface, target string) error {
-	if target == "" {
-		target = "1.1.1.1"
-	}
-	out, err := exec.Command("ping", "-I", iface, "-c", "2", "-W", "3", target).CombinedOutput()
+// raiseCommittedVPN raises the committed vpn.conf.
+func raiseCommittedVPN() error {
+	v, err := loadVPN()
 	if err != nil {
-		return fmt.Errorf("ping -I %s %s: %v: %s", iface, target, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("no vpn config stored: %w", err)
 	}
-	return nil
+	return raiseAndValidateVPN(v)
 }
 
 func waitWGHandshake(timeout time.Duration) error {
@@ -294,33 +315,21 @@ func waitTailscaleRunning(timeout time.Duration) error {
 	return fmt.Errorf("tailscale BackendState/netcheck not healthy within %s", timeout)
 }
 
-// startVPN is kept for callers that only need the raise attempt; all
-// state publication goes through raiseAndValidateVPN / checkCaptiveAndVPN.
-func startVPN() error { return raiseAndValidateVPN() }
-
-func stopVPN() error {
+// stopTunnel tears the tunnel down and removes the dnsmasq upstream.
+// It does NOT set Status: the resulting state is the caller's
+// decision (Decision Log 45 table in control.go).
+func stopTunnel() {
 	v, err := loadVPN()
-	if err == nil {
-		switch v.Type {
-		case "wireguard":
-			_ = exec.Command("systemctl", "stop", "wg-quick@wg-hsl.service").Run()
-		case "tailscale":
-			_ = exec.Command("tailscale", "down").Run()
-		}
+	if err == nil && v.Type == "tailscale" {
+		_ = exec.Command("tailscale", "down").Run()
 	} else {
 		_ = exec.Command("systemctl", "stop", "wg-quick@wg-hsl.service").Run()
+		if err == nil && v.Type == "tailscale" {
+			_ = exec.Command("tailscale", "down").Run()
+		}
 	}
 	setDNSUpstream("")
 	store.update(func(s *State) { s.VPN = false })
-	// Wi-Fi stays joined (§F4): the no-VPN terminal state is
-	// online_no_vpn when a lease is held, idle otherwise (F20 resolved
-	// by the updated contract's online_no_vpn state).
-	if wifiOnline() {
-		store.set("online_no_vpn", "")
-	} else {
-		store.set("idle", "")
-	}
-	return nil
 }
 
 // setDNSUpstream owns the dnsmasq server= line at runtime (§F4 DNS
@@ -351,67 +360,102 @@ func setDNSUpstream(server string) {
 	log.Printf("dnsmasq upstream set to %q (empty = fail-closed)", server)
 }
 
-// mergedRuleset is the §F4 kill switch: ONE ruleset, also shipped as
-// firmware/configs/nftables.conf and installed to /etc/nftables.conf.
-const mergedRuleset = `table inet hsl_filter {
- chain forward {
-  type filter hook forward priority 0; policy drop;
-  ct state established,related accept
-  jump portal_pass
-  iifname "usb0" oifname { "wg-hsl", "tailscale0", "tun0" } accept
-  iifname "wlan0" oifname { "wg-hsl", "tailscale0", "tun0" } accept
- }
- chain portal_pass {
- }
- chain input {
-  type filter hook input priority 0; policy accept;
- }
-}
-table ip hsl_nat {
- chain postrouting {
-  type nat hook postrouting priority 100; policy accept;
-  ip saddr 192.168.64.0/24 oifname { "wg-hsl", "tailscale0", "tun0" } masquerade
-  ip saddr 192.168.65.0/24 oifname { "wg-hsl", "tailscale0", "tun0" } masquerade
- }
-}
-`
+// --- Internet check (§F4): tri-state, never conflated ---
 
-// applyKillSwitch loads the merged ruleset from /etc/nftables.conf
-// (nftables.service owns boot loading; this is the daemon's verify /
-// re-apply). provisiond never loads a private table of its own (F5).
-func applyKillSwitch() error {
-	if _, err := os.Stat(nftFile); err == nil {
-		out, err := exec.Command("nft", "-f", nftFile).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("nft -f %s: %v: %s", nftFile, err, strings.TrimSpace(string(out)))
+const (
+	netOK = iota
+	netPortal
+	netUnreachable
+)
+
+// internetCheck GETs generate_204. A non-204 HTTP RESPONSE means a
+// portal; NO response at all (transport error) is internet_unreachable
+// — it is never captive_portal (Decision Log 42).
+func internetCheck() int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://connectivitycheck.gstatic.com/generate_204")
+	if err != nil {
+		return netUnreachable
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode == 204 {
+		return netOK
+	}
+	return netPortal
+}
+
+func ntpSynchronized() bool {
+	out, err := exec.Command("timedatectl", "show", "-p", "NTPSynchronized", "--value").CombinedOutput()
+	return err == nil && strings.TrimSpace(string(out)) == "yes"
+}
+
+// waitNTPSynchronized implements the §F4 clock rule: wait for
+// systemd-timesyncd up to the given budget (≤10 s, inside the
+// internet-check phase budget).
+func waitNTPSynchronized(budget time.Duration) {
+	if budget > 10*time.Second {
+		budget = 10 * time.Second
+	}
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if ntpSynchronized() {
+			return
 		}
-		return nil
+		time.Sleep(500 * time.Millisecond)
 	}
-	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(mergedRuleset)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("nft load merged ruleset: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	log.Printf("clock not NTPSynchronized within %s; proceeding with internet check", budget)
 }
 
-func killSwitchInPlace() bool { return applyKillSwitch() == nil }
+// --- Captive-portal pass (§F4: grant and re-check are TWO commands) ---
 
-// portalPass (§F4, F4-fix): resolve the connectivity-check host and the
-// portal redirect target, insert destination-scoped accepts into the
-// hsl_filter portal_pass chain (source usb0 only, tcp 80/443 only),
-// journal-log IPs + expiry, auto-delete after exactly 10 min.
-func portalPass() {
-	ips := map[string]bool{}
+const (
+	passConfPath = "/etc/dnsmasq.d/hsl-pass.conf"
+	passLogPath  = "/run/homesteadlink/dnsmasq-pass.log"
+)
+
+var passMu sync.Mutex
+var passActive bool
+var passAdmitted = map[string]bool{}
+
+func portalPassActive() bool {
+	passMu.Lock()
+	defer passMu.Unlock()
+	return passActive
+}
+
+// portalPassGrant opens the 10-minute pass. Gate (caller-enforced
+// and re-checked here): state captive_portal and no pass active.
+// Steps (§F4): resolve the check host + redirect target through the
+// uplink's DHCP DNS (uplink_dns in state.json) with one-shot queries
+// that bypass dnsmasq; insert destination-scoped accepts into the
+// portal_pass chain (usb0 only, tcp 80/443); run dnsmasq with the
+// pass config (server=<uplink DNS> + log-queries) and admit every A
+// record the USB client resolves during the pass within 1 s; flush
+// everything at exactly 10 min.
+func portalPassGrant() {
+	passMu.Lock()
+	if passActive {
+		passMu.Unlock()
+		log.Printf("portal_pass rejected: a pass is already active (busy)")
+		store.update(func(s *State) { s.Error = "busy" })
+		return
+	}
+	passActive = true
+	passAdmitted = map[string]bool{}
+	passMu.Unlock()
+
+	dns := store.getUplinkDNS()
+	ips := map[string]string{} // ip -> hostname (for the journal)
+	resolve := func(host string) {
+		for _, ip := range resolveViaUplink(host, dns) {
+			ips[ip] = host
+		}
+	}
 	checkHost := "connectivitycheck.gstatic.com"
-	if addrs, err := net.LookupIP(checkHost); err == nil {
-		for _, a := range addrs {
-			if a.To4() != nil {
-				ips[a.String()] = true
-			}
-		}
-	}
-	// Follow the portal redirect target (if any) and resolve it too.
+	resolve(checkHost)
+	// The portal redirect target (one no-redirect fetch; device-
+	// originated traffic is allowed by the output chain pre-pass).
 	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
@@ -420,46 +464,155 @@ func portalPass() {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if loc != "" {
-			if u, err := net.LookupIP(hostOf(loc)); err == nil {
-				for _, a := range u {
-					if a.To4() != nil {
-						ips[a.String()] = true
-					}
-				}
+			if h := hostOf(loc); h != "" {
+				resolve(h)
+				log.Printf("portal_pass: redirect target host %s", h)
 			}
-			log.Printf("portal_pass: redirect target %s", loc)
 		}
 	}
-	if len(ips) == 0 {
-		log.Printf("portal_pass: no portal IPs resolved; no hole opened")
+	for ip, host := range ips {
+		admitPortalIP(ip, host)
+	}
+
+	// Pass DNS: dnsmasq gets the uplink upstream + query logging via
+	// the pass-only config file; removed again at expiry.
+	_ = os.MkdirAll("/run/homesteadlink", 0o755)
+	_ = os.WriteFile(passLogPath, nil, 0o644)
+	if dns != "" {
+		conf := "server=" + dns + "\nlog-queries\nlog-facility=" + passLogPath + "\n"
+		if err := writeFileAtomic(passConfPath, []byte(conf), 0o644); err != nil {
+			log.Printf("portal_pass: cannot write %s: %v", passConfPath, err)
+		}
+	} else {
+		log.Printf("portal_pass: no uplink_dns captured — pass DNS upstream unavailable (grant continues with resolved IPs only)")
+	}
+	_ = exec.Command("systemctl", "restart", "dnsmasq.service").Run()
+
+	expiry := time.Now().Add(10 * time.Minute)
+	log.Printf("portal_pass: GRANTED — dst set %v via dns=%q, expires %s (exactly 10 min)", ips, dns, expiry.Format(time.RFC3339))
+	go passAdmissionLoop(expiry)
+	go func() {
+		time.Sleep(10 * time.Minute)
+		portalPassExpire()
+	}()
+}
+
+// resolveViaUplink resolves host with one-shot DNS queries sent
+// directly to the uplink DNS server (bypassing dnsmasq, which has no
+// upstream until the pass config runs). Falls back to the system
+// resolver when no uplink DNS is known.
+func resolveViaUplink(host, dns string) []string {
+	var ips []string
+	if dns == "" {
+		addrs, err := net.LookupIP(host)
+		if err != nil {
+			return nil
+		}
+		for _, a := range addrs {
+			if a.To4() != nil {
+				ips = append(ips, a.String())
+			}
+		}
+		return ips
+	}
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			return d.DialContext(ctx, "udp", net.JoinHostPort(dns, "53"))
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	addrs, err := r.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		log.Printf("portal_pass: resolve %s via uplink dns %s failed: %v", host, dns, err)
+		return nil
+	}
+	for _, a := range addrs {
+		if a.To4() != nil {
+			ips = append(ips, a.String())
+		}
+	}
+	return ips
+}
+
+// admitPortalIP inserts ONE destination-scoped accept into the
+// portal_pass chain (the chain's only writer is this file) and
+// journals the admission with its hostname (§F4 step 2b).
+func admitPortalIP(ip, host string) {
+	passMu.Lock()
+	if passAdmitted[ip] {
+		passMu.Unlock()
 		return
 	}
-	var set []string
-	for ip := range ips {
-		set = append(set, ip)
-	}
-	expiry := time.Now().Add(10 * time.Minute)
-	rule := fmt.Sprintf("iifname \"usb0\" ip daddr { %s } tcp dport { 80, 443 } accept comment \"hsl-portal-pass\"",
-		strings.Join(set, ", "))
-	add := exec.Command("nft", append([]string{"add", "rule", "inet", "hsl_filter", "portal_pass"}, strings.Fields(rule)...)...)
-	// strings.Fields would split the quoted comment/set braces wrongly;
-	// pass the rule as a single -f snippet instead.
-	_ = add
-	snippet := fmt.Sprintf("add rule inet hsl_filter portal_pass %s\n", rule)
+	passAdmitted[ip] = true
+	passMu.Unlock()
+	snippet := fmt.Sprintf("add rule inet hsl_filter portal_pass iifname \"usb0\" ip daddr %s tcp dport { 80, 443 } accept comment \"hsl-portal-pass\"\n", ip)
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(snippet)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("portal_pass add failed: %v: %s", err, strings.TrimSpace(string(out)))
+		log.Printf("portal_pass: nft add for %s (%s) failed: %v: %s", ip, host, err, strings.TrimSpace(string(out)))
 		return
 	}
-	portalGrantUntil = expiry
-	log.Printf("portal_pass: granted dst=%v tcp 80/443 from usb0 only, expires %s", set, expiry.Format(time.RFC3339))
-	go func() {
-		time.Sleep(10 * time.Minute)
-		removePortalPass()
-		portalGrantUntil = time.Time{}
-		log.Printf("portal_pass: temporary exception expired and removed")
-	}()
+	log.Printf("portal_pass: admitted dst=%s host=%s (usb0, tcp 80/443)", ip, host)
+}
+
+// passAdmissionLoop tails the dnsmasq pass log (100 ms poll) and
+// admits every A record the USB client resolves through the pass
+// upstream — the sign-in flow's auth/CDN hosts are unknown at grant
+// time, so the log is the admission channel (§F4 step 2b).
+func passAdmissionLoop(expiry time.Time) {
+	var offset int64
+	for time.Now().Before(expiry) && portalPassActive() {
+		time.Sleep(100 * time.Millisecond)
+		fi, err := os.Stat(passLogPath)
+		if err != nil || fi.Size() < offset {
+			continue
+		}
+		if fi.Size() == offset {
+			continue
+		}
+		f, err := os.Open(passLogPath)
+		if err != nil {
+			continue
+		}
+		_, _ = f.Seek(offset, io.SeekStart)
+		buf := make([]byte, fi.Size()-offset)
+		n, _ := f.Read(buf)
+		f.Close()
+		offset += int64(n)
+		for _, line := range strings.Split(string(buf[:n]), "\n") {
+			// dnsmasq log-queries reply line: "reply <host> is <ip>"
+			fields := strings.Fields(line)
+			for i, fld := range fields {
+				if fld == "reply" && i+3 < len(fields) && fields[i+2] == "is" {
+					host, ipStr := fields[i+1], fields[i+3]
+					if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil {
+						admitPortalIP(ipStr, host)
+					}
+				}
+			}
+		}
+	}
+}
+
+// portalPassExpire removes the whole exception at exactly 10 min:
+// flush the chain, remove the pass config, truncate the log, restart
+// dnsmasq (§F4 pass scope).
+func portalPassExpire() {
+	passMu.Lock()
+	if !passActive {
+		passMu.Unlock()
+		return
+	}
+	passActive = false
+	passMu.Unlock()
+	_ = exec.Command("nft", "flush", "chain", "inet", "hsl_filter", "portal_pass").Run()
+	_ = os.Remove(passConfPath)
+	_ = os.WriteFile(passLogPath, nil, 0o644)
+	_ = exec.Command("systemctl", "restart", "dnsmasq.service").Run()
+	log.Printf("portal_pass: expired — chain flushed, pass DNS removed, dnsmasq restarted")
 }
 
 func hostOf(rawurl string) string {
@@ -473,67 +626,64 @@ func hostOf(rawurl string) string {
 	return s
 }
 
-var handleRe = regexp.MustCompile(`handle (\d+)`)
-
-var portalGrantUntil time.Time
-
-func portalGrantActive() bool { return time.Now().Before(portalGrantUntil) }
-
-func removePortalPass() {
-	out, err := exec.Command("nft", "-a", "list", "chain", "inet", "hsl_filter", "portal_pass").CombinedOutput()
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "hsl-portal-pass") {
-			if m := handleRe.FindStringSubmatch(line); m != nil {
-				_ = exec.Command("nft", "delete", "rule", "inet", "hsl_filter", "portal_pass", "handle", m[1]).Run()
+// portalRecheck is the §F4 re-check command: it re-runs the internet
+// check whether or not a pass is active — portal_pass never does
+// this. On 204 the paused party (transaction or boot rejoin)
+// continues; on transport error the paused transaction rolls back
+// with internet_unreachable (DL42) and a paused rejoin drops to the
+// 60 s re-check loop.
+func portalRecheck() {
+	switch internetCheck() {
+	case netOK:
+		switch portalPauseKind() {
+		case "tx":
+			// Take the channel and clear the pause atomically: a
+			// second recheck must not close it again.
+			portalPause.Lock()
+			ch := portalPause.resumeCh
+			portalPause.kind = ""
+			portalPause.resumeCh = nil
+			portalPause.abortCh = nil
+			portalPause.Unlock()
+			if ch != nil {
+				close(ch)
+			}
+		case "rejoin":
+			clearPortalPause()
+			log.Printf("portal_recheck: 204 — boot rejoin continues at the VPN step")
+			go vpnStep()
+		default:
+			log.Printf("portal_recheck: 204 — no paused party; refreshing post-join flow")
+			if hasVPNConfig() {
+				_ = raiseCommittedVPN()
+			} else if wifiOnline() {
+				store.set("online_no_vpn", "")
 			}
 		}
-	}
-}
-
-// waitNTPSynchronized implements the §F4 clock rule: ≤10 s wait for
-// systemd-timesyncd before the internet check.
-func waitNTPSynchronized() {
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		out, err := exec.Command("timedatectl", "show", "-p", "NTPSynchronized", "--value").CombinedOutput()
-		if err == nil && strings.TrimSpace(string(out)) == "yes" {
-			return
+	case netPortal:
+		log.Printf("portal_recheck: still a portal (non-204) — staying captive_portal")
+		if store.get().State != "captive_portal" {
+			store.set("captive_portal", "captive_portal")
 		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	log.Printf("clock not NTPSynchronized after 10s; proceeding with internet check")
-}
-
-// checkCaptive does the §F4 connectivity check after DHCP.
-func checkCaptive() bool {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://connectivitycheck.gstatic.com/generate_204")
-	if err != nil {
-		return true // unreachable counts as not-clean internet
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode != 204
-}
-
-// checkCaptiveAndVPN runs after a successful join: NTP wait, captive
-// check, then the VPN raise+validation — the only route to `online`.
-// With no VPN config the terminal state is online_no_vpn (F2).
-func checkCaptiveAndVPN() {
-	waitNTPSynchronized()
-	if checkCaptive() {
-		store.set("captive_portal", "captive_portal")
-		log.Printf("captive portal detected (non-204 from generate_204); kill switch stays up")
-		return
-	}
-	if hasVPNConfig() {
-		if err := raiseAndValidateVPN(); err != nil {
-			log.Printf("vpn raise/validation failed: %v", err)
+	case netUnreachable:
+		switch portalPauseKind() {
+		case "tx":
+			portalPause.Lock()
+			ch := portalPause.abortCh
+			portalPause.kind = ""
+			portalPause.resumeCh = nil
+			portalPause.abortCh = nil
+			portalPause.Unlock()
+			if ch != nil {
+				close(ch)
+			}
+		case "rejoin":
+			clearPortalPause()
+			store.set("idle", "internet_unreachable")
+			go rejoinRecheckLoop()
+		default:
+			store.set("idle", "internet_unreachable")
 		}
-		return
+		log.Printf("portal_recheck: transport error — internet_unreachable (never captive_portal)")
 	}
-	store.set("online_no_vpn", "")
 }

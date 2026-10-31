@@ -19,7 +19,7 @@ OUT_NAME=${OUT_NAME:-"homesteadlink-v1.1-orangepizero2w.img.xz"}
 WORK=${WORK:-"$HERE/work"}
 ARMBIAN_URL=${ARMBIAN_URL:-"https://archive.armbian.com/orangepizero2w/archive/Armbian_25.5.1_Orangepizero2w_noble_current_6.12.23.img.xz"}
 PKGS="dnsmasq hostapd nftables"
-ASSERT_PKGS="bluez wpasupplicant wireguard-tools dnsmasq hostapd nftables tailscale"
+ASSERT_PKGS="bluez wpasupplicant wireguard-tools dnsmasq hostapd nftables tailscale iw rfkill"
 mkdir -p "$OUT_DIR" "$WORK"
 log() { echo "[build-image] $*"; }
 fail() { echo "[build-image] FAIL: $*" >&2; exit 1; }
@@ -273,7 +273,7 @@ stage_file() { # src dest mode
 }
 stage_file "$BIN" /opt/homesteadlink/bin/hsl-provisiond 755
 stage_file "$FW/systemd/hsl-firstboot.sh" /opt/homesteadlink/bin/hsl-firstboot.sh 755
-stage_file "$FW/systemd/hsl-setup-code" /usr/local/bin/hsl-setup-code 755
+stage_file "$FW/systemd/hsl-setup-code" /usr/local/sbin/hsl-setup-code 755
 stage_file "$FW/VERSION" /opt/homesteadlink/VERSION 644
 for u in hsl-bt-attach.service hsl-firstboot.service hsl-provisiond.service; do
   stage_file "$FW/systemd/$u" "/etc/systemd/system/$u" 644
@@ -287,8 +287,8 @@ stage_file "$FW/configs/nftables.conf" /etc/nftables.conf 644
 stage_file "$FW/configs/dnsmasq-homesteadlink.conf" /etc/dnsmasq.d/homesteadlink.conf 644
 stage_file "$FW/configs/hostapd-homesteadlink.conf" /etc/hostapd/hostapd.conf 644
 stage_file "$FW/configs/bluetooth-main.conf" /etc/bluetooth/main.conf 644
-stage_file "$FW/configs/networkd/20-usb0.network" /etc/systemd/network/20-usb0.network 644
-stage_file "$FW/configs/networkd/30-wlan0.network" /etc/systemd/network/30-wlan0.network 644
+stage_file "$FW/configs/20-usb0.network" /etc/systemd/network/20-usb0.network 644
+stage_file "$FW/configs/30-wlan0.network" /etc/systemd/network/30-wlan0.network 644
 stage_file "$DTBO" /boot/overlay-user/bt-uart.dtbo 644
 stage_file "$ENV_FILE" /boot/armbianEnv.txt 644
 mkdir -p "$PAY/etc/systemd/journald.conf.d"
@@ -311,6 +311,7 @@ if [ "$MODE" = "loop" ]; then
   ln -sf /dev/null "$ROOT/etc/systemd/system/ssh.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/sshd.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/NetworkManager.service"
+  rm -f "$ROOT/root/.not_logged_in_yet" # §F1: Armbian first-login flow disabled
   log "injected payload (loop mode)"
   sync; umount "$WORK/mnt"; losetup -d "$LOOP"; LOOP=""; trap - EXIT INT TERM
 else
@@ -346,6 +347,8 @@ else
   echo "symlink /etc/systemd/system/ssh.service /dev/null" >> "$CMDS"
   echo "symlink /etc/systemd/system/sshd.service /dev/null" >> "$CMDS"
   echo "symlink /etc/systemd/system/NetworkManager.service /dev/null" >> "$CMDS"
+  # §F1: disable the Armbian first-login flow (trigger exists in stock).
+  echo "rm /root/.not_logged_in_yet" >> "$CMDS"
   debugfs -w -f "$CMDS" "$ROOTPART_IMG" > "$WORK/debugfs.log" 2>&1 || fail "debugfs injection failed (see $WORK/debugfs.log)"
   # --- artifact assertions against the FINAL rootfs (F6) ---
   assert_stat() { debugfs -R "stat $1" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: regular" || fail "artifact assertion: $1 missing"; }
@@ -358,6 +361,11 @@ else
   assert_stat /usr/sbin/dnsmasq
   assert_stat /usr/sbin/hostapd
   assert_stat /usr/bin/tailscale
+  assert_stat /usr/local/sbin/hsl-setup-code
+  assert_stat /opt/homesteadlink/configs/dnsmasq-ap.conf
+  assert_stat /etc/systemd/network/20-usb0.network
+  assert_stat /etc/systemd/network/30-wlan0.network
+  debugfs -R "stat /root/.not_logged_in_yet" "$ROOTPART_IMG" 2>/dev/null | grep -q "Inode:" && fail "artifact assertion: Armbian first-login trigger still present (§F1)"
   debugfs -R "stat /etc/systemd/system/multi-user.target.wants/hsl-provisiond.service" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: symlink" || fail "artifact assertion: hsl-provisiond.service not enabled"
   debugfs -R "dump /var/lib/dpkg/status $WORK/dpkg-status.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final dpkg status"
   for p in $ASSERT_PKGS; do

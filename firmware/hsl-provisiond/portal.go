@@ -2,35 +2,105 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 )
 
-// apFallbackServer (§F5, F7/F13): the config page binds the canonical
-// addresses — 192.168.64.1:8080 on usb0 and 192.168.65.1:8080 in AP
-// mode — serves only while unconfigured / in AP mode, and EVERY POST
-// requires the setup-code token (§F5; F7.7 tests the rejection).
-func tokenOK(r *http.Request, formToken string) bool {
-	if identity.SetupCode == "" {
+// Config page (§F5 contract — ONE page, both addresses):
+//   GET /            HTML form + current state
+//   GET /status      the Status JSON (same shape as GATT Status)
+//   POST /wifi       JSON = WifiConfig schema → the §F4 transaction
+//   POST /vpn        JSON = VpnConfig schema → the one staging rule
+//   GET /diagnostics the diag.tar.gz (Control diagnostics bundle)
+//
+// Token = the console password (§F1), transported in the
+// X-HSL-Token header, required on EVERY endpoint including GET /:
+// an unauthenticated request gets HTTP 403 with the plain-text body
+// "X-HSL-Token required" — no form, no state, no data. Brute-force
+// control: 5 failed token attempts from one source IP lock that IP
+// out for 15 min (journal-logged); a successful auth resets the
+// counter. Availability: binds 192.168.64.1:8080 whenever provisiond
+// runs (NOT pre-setup-only) and 192.168.65.1:8080 while AP mode is
+// active. POST endpoints additionally accept the token as a form /
+// JSON field so the served HTML form can be submitted from a
+// browser; the failure counting applies identically.
+
+type tokenGate struct {
+	mu       sync.Mutex
+	failures map[string]int
+	locked   map[string]time.Time
+}
+
+var pageGate = &tokenGate{failures: map[string]int{}, locked: map[string]time.Time{}}
+
+func sourceIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// checkToken validates the request's token. A failure is counted;
+// the 5th failure from one IP locks it for 15 min.
+func (g *tokenGate) checkToken(r *http.Request, formToken string) bool {
+	if identity.ConsolePass == "" {
 		return false
 	}
-	if r.Header.Get("X-Setup-Code") == identity.SetupCode {
+	ip := sourceIP(r)
+	g.mu.Lock()
+	if until, ok := g.locked[ip]; ok && time.Now().Before(until) {
+		g.mu.Unlock()
+		return false
+	}
+	g.mu.Unlock()
+
+	ok := r.Header.Get("X-HSL-Token") == identity.ConsolePass || formToken == identity.ConsolePass
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if ok {
+		delete(g.failures, ip)
 		return true
 	}
-	if r.URL.Query().Get("token") == identity.SetupCode {
+	g.failures[ip]++
+	if g.failures[ip] >= 5 {
+		g.locked[ip] = time.Now().Add(15 * time.Minute)
+		delete(g.failures, ip)
+		log.Printf("config page: source IP %s locked out for 15 min after 5 failed token attempts", ip)
+	}
+	return false
+}
+
+func (g *tokenGate) require(w http.ResponseWriter, r *http.Request, formToken string) bool {
+	if g.checkToken(r, formToken) {
 		return true
 	}
-	return formToken == identity.SetupCode
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte("X-HSL-Token required"))
+	return false
 }
 
 func apFallbackServer() {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if !pageGate.require(w, r, "") {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(store.json())
+	})
+
 	mux.HandleFunc("/diagnostics", func(w http.ResponseWriter, r *http.Request) {
-		if !tokenOK(r, "") {
-			http.Error(w, "setup-code token required", http.StatusForbidden)
+		if !pageGate.require(w, r, "") {
 			return
 		}
 		if _, err := os.Stat(diagPath); err != nil {
@@ -42,44 +112,85 @@ func apFallbackServer() {
 		w.Header().Set("Content-Type", "application/gzip")
 		http.ServeFile(w, r, diagPath)
 	})
+
+	mux.HandleFunc("/wifi", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var p WifiConfigPayload
+		token := ""
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			var body struct {
+				WifiConfigPayload
+				Token string `json:"token"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			p, token = body.WifiConfigPayload, body.Token
+		} else {
+			_ = r.ParseForm()
+			p.SSID = r.FormValue("ssid")
+			p.PSK = r.FormValue("psk")
+			p.Country = r.FormValue("country")
+			p.Hidden = r.FormValue("hidden") == "on"
+			token = r.FormValue("token")
+		}
+		if !pageGate.require(w, r, token) {
+			return
+		}
+		payload, _ := json.Marshal(p)
+		parsed, code := validateWifiPayload(payload)
+		if code != "" {
+			store.update(func(s *State) { s.Error = code })
+			http.Error(w, "wifi config invalid: "+code, http.StatusBadRequest)
+			return
+		}
+		if securityClass(*parsed) == "eap" {
+			store.set("idle", "unsupported_eap")
+			http.Error(w, "802.1X/EAP not supported in v1", http.StatusBadRequest)
+			return
+		}
+		fingerprint("wifi psk (config page)", parsed.PSK)
+		go runWifiTransaction(parsed)
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("applying — watch /status"))
+	})
+
+	mux.HandleFunc("/vpn", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			VpnConfigPayload
+			Token string `json:"token"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		if !pageGate.require(w, r, body.Token) {
+			return
+		}
+		payload, _ := json.Marshal(body.VpnConfigPayload)
+		if _, code := stageVpnConfig(payload); code != "" {
+			store.update(func(s *State) { s.Error = code })
+			http.Error(w, "vpn config invalid: "+code, http.StatusBadRequest)
+			return
+		}
+		if isTxActive() {
+			log.Printf("config page: VpnConfig staged in candidate/ for the running transaction")
+		} else {
+			commitStagedVpnNow()
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("vpn config stored"))
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			var p WifiConfigPayload
-			token := ""
-			if r.Header.Get("Content-Type") == "application/json" {
-				var body struct {
-					WifiConfigPayload
-					Token string `json:"token"`
-				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
-				p, token = body.WifiConfigPayload, body.Token
-			} else {
-				_ = r.ParseForm()
-				p.SSID = r.FormValue("ssid")
-				p.PSK = r.FormValue("psk")
-				p.Country = r.FormValue("country")
-				p.Hidden = r.FormValue("hidden") == "on"
-				token = r.FormValue("token")
-			}
-			if !tokenOK(r, token) {
-				http.Error(w, "setup-code token required", http.StatusForbidden)
-				return
-			}
-			if p.SSID == "" {
-				http.Error(w, "ssid required", http.StatusBadRequest)
-				return
-			}
-			fingerprint("wifi psk (config page)", p.PSK)
-			payload, _ := json.Marshal(p)
-			go func() {
-				if err := applyWifiTransaction(payload); err != nil {
-					log.Printf("config page wifi apply: %v", err)
-					return
-				}
-				checkCaptiveAndVPN()
-			}()
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte("<html><body><h1>Applying…</h1><p>Joining the network. Watch the device status.</p></body></html>"))
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if !pageGate.require(w, r, "") {
 			return
 		}
 		st := store.get()
@@ -87,9 +198,8 @@ func apFallbackServer() {
 		_, _ = w.Write([]byte(`<html><head><title>HomeSteadyLink setup</title></head><body>
 <h1>HomeSteadyLink setup</h1>
 <p>State: ` + st.State + `</p>
-<p>Setup code (also on the device label): ` + identity.SetupCode + `</p>
-<form method="post">
-<label>Setup-code token<br><input name="token" required></label><br><br>
+<form method="post" action="/wifi">
+<label>Console-password token<br><input name="token" type="password" required></label><br><br>
 <label>Wi-Fi name (SSID)<br><input name="ssid" required></label><br><br>
 <label>Wi-Fi password<br><input name="psk" type="password"></label><br><br>
 <label>Country (2-letter)<br><input name="country" size="2"></label><br><br>
@@ -98,23 +208,21 @@ func apFallbackServer() {
 </form></body></html>`))
 	})
 
+	// Availability (§F5): 192.168.64.1 whenever the daemon runs;
+	// 192.168.65.1 binds as soon as AP mode assigns the address.
 	addrs := []string{"192.168.64.1:8080", "192.168.65.1:8080"}
 	serving := map[string]bool{}
 	for {
-		if hasWifiConfig() {
-			time.Sleep(10 * time.Second)
-			continue
-		}
 		for _, addr := range addrs {
 			if serving[addr] {
 				continue
 			}
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
-				continue // interface address not up yet
+				continue // interface address not up (yet / anymore)
 			}
 			serving[addr] = true
-			log.Printf("config page listening on %s (token-gated)", addr)
+			log.Printf("config page listening on %s (console-password token on every endpoint)", addr)
 			srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 			go func(a string, l net.Listener) {
 				_ = srv.Serve(l)

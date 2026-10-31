@@ -16,9 +16,14 @@ func btSupervision() {
 		if _, err := os.Stat("/sys/class/bluetooth/hci0"); err == nil {
 			if btDead {
 				btDead = false
-				if store.get().Error == "bt_dead" {
-					store.set("idle", "")
-				}
+				// Recovery clears ONLY the error (§F8 15.3): the
+				// operational state is whatever the state machine
+				// says — never forced to idle here.
+				store.update(func(s *State) {
+					if s.Error == "bt_dead" {
+						s.Error = ""
+					}
+				})
 			}
 			time.Sleep(5 * time.Second)
 			continue
@@ -35,11 +40,14 @@ func btSupervision() {
 		if appeared {
 			continue
 		}
-		// GUARD (R3-1): never power-cycle the shared radio while the
-		// device is online — the cycle would drop the Wi-Fi uplink
-		// carrying client traffic. Retry later instead.
-		if st := store.get(); st.State == "online" || st.State == "online_no_vpn" {
-			log.Printf("hci0 absent but device is %s: skipping module power-cycle (router is carrying traffic)", st.State)
+		// GUARD (§F2 / §F8 15.2): never power-cycle the shared
+		// UWE5622 radio while online / online_no_vpn or while a
+		// Wi-Fi/VPN transaction is in flight — Wi-Fi shares the
+		// power line. In those states: re-attach ONLY, and defer
+		// the power-cycle until the device is idle.
+		if st := store.get(); st.State == "online" || st.State == "online_no_vpn" || isTxActive() {
+			log.Printf("hci0 absent but device is %s (tx active: %v): re-attach only, power-cycle deferred", st.State, isTxActive())
+			_ = exec.Command("systemctl", "restart", "hsl-bt-attach.service").Run()
 			time.Sleep(15 * time.Second)
 			continue
 		}

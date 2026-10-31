@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -18,7 +17,7 @@ import (
 func knownControlCmd(cmd string) bool {
 	switch cmd {
 	case "reboot", "factory_reset", "close_window", "vpn_stop", "vpn_start",
-		"unbond", "portal_pass", "diagnostics":
+		"unbond", "portal_pass", "portal_recheck", "diagnostics":
 		return true
 	}
 	return false
@@ -26,8 +25,14 @@ func knownControlCmd(cmd string) bool {
 
 // handleControl executes §F4 Control commands. Runs in its own
 // goroutine from the write path; unknown commands never reach here
-// (rejected synchronously in the GATT write handler, F16).
+// (rejected synchronously in the GATT write handler, F16). EVERY
+// command is owner-checked here as well as on the write path (§F8
+// item 16.4 — no reliance on a single gate).
 func handleControl(cmd string, options map[string]dbus.Variant, s *gattServer) {
+	if !isOwner(options) {
+		log.Printf("control: %s rejected — not the owner", cmd)
+		return
+	}
 	switch cmd {
 	case "reboot":
 		log.Printf("control: reboot")
@@ -44,19 +49,41 @@ func handleControl(cmd string, options map[string]dbus.Variant, s *gattServer) {
 			s.CloseWindow()
 		}
 	case "vpn_stop":
-		log.Printf("control: vpn_stop")
-		_ = stopVPN()
+		// Decision Log 45: online → online_no_vpn; vpn_failed →
+		// online_no_vpn (committed-but-down vpn.conf stays stored);
+		// no VPN up → no-op success, state unchanged.
+		st := store.get()
+		switch st.State {
+		case "online", "vpn_failed":
+			log.Printf("control: vpn_stop from %s → online_no_vpn", st.State)
+			stopTunnel()
+			store.set("online_no_vpn", "")
+		default:
+			log.Printf("control: vpn_stop no-op (state %s, no VPN up)", st.State)
+		}
 	case "vpn_start":
-		log.Printf("control: vpn_start")
-		// F2: online only via the §F4 raise+validation path.
-		if err := raiseAndValidateVPN(); err != nil {
-			log.Printf("vpn_start: %v", err)
+		// Decision Log 45: already online → no-op; no committed
+		// vpn.conf → rejected error=vpn_config_invalid, state
+		// unchanged; Wi-Fi + internet not up → rejected error=busy,
+		// state unchanged; from online_no_vpn / vpn_failed →
+		// vpn_starting → online / vpn_failed via the commit check.
+		st := store.get()
+		switch {
+		case st.State == "online":
+			log.Printf("control: vpn_start no-op (already online)")
+		case !hasVPNConfig():
+			log.Printf("control: vpn_start rejected — no committed vpn.conf (vpn_config_invalid)")
+			store.update(func(s *State) { s.Error = "vpn_config_invalid" })
+		case st.State != "online_no_vpn" && st.State != "vpn_failed":
+			log.Printf("control: vpn_start rejected — state %s has no committed Wi-Fi + internet up (busy)", st.State)
+			store.update(func(s *State) { s.Error = "busy" })
+		default:
+			log.Printf("control: vpn_start from %s", st.State)
+			if err := raiseCommittedVPN(); err != nil {
+				log.Printf("vpn_start: %v (state vpn_failed set by the raise path)", err)
+			}
 		}
 	case "unbond":
-		if !isOwner(options) {
-			log.Printf("control: unbond rejected — not the owner")
-			return
-		}
 		log.Printf("control: unbond (owner) — bond removed, peer disconnected")
 		unbondAll()
 		if s != nil {
@@ -66,18 +93,24 @@ func handleControl(cmd string, options map[string]dbus.Variant, s *gattServer) {
 			s.disconnectAllCentrals()
 		}
 	case "portal_pass":
-		// R3-1: grant and recheck are SEPARATE operations. With no
-		// active grant, portal_pass only opens the exception. While
-		// a grant is active, portal_pass is the app's explicit
-		// recheck trigger (§F4: "sends portal_pass again to re-run
-		// the check") — it does not extend or re-open the grant.
-		if portalGrantActive() {
-			log.Printf("control: portal_pass — recheck (grant already active)")
-			checkCaptiveAndVPN()
-		} else {
-			log.Printf("control: portal_pass — grant only (no recheck side effect)")
-			portalPass()
+		// §F4: portal_pass GRANTS only — it never re-checks. Valid
+		// only in state captive_portal with no pass active; while a
+		// pass is active it is rejected with error=busy.
+		if store.get().State != "captive_portal" {
+			log.Printf("control: portal_pass rejected — state is %s, not captive_portal (no grant)", store.get().State)
+			return
 		}
+		if portalPassActive() {
+			log.Printf("control: portal_pass rejected — pass already active (busy, no extension, no re-grant)")
+			store.update(func(sx *State) { sx.Error = "busy" })
+			return
+		}
+		log.Printf("control: portal_pass — granting the 10-minute pass (no recheck)")
+		portalPassGrant()
+	case "portal_recheck":
+		// §F4: portal_recheck is the ONLY re-check command.
+		log.Printf("control: portal_recheck — re-running the internet check")
+		portalRecheck()
 	case "diagnostics":
 		log.Printf("control: diagnostics — building %s", diagPath)
 		if err := buildDiagnostics(); err != nil {
@@ -108,8 +141,10 @@ func (s *gattServer) disconnectAllCentrals() {
 }
 
 // factoryReset (§F4 exact scope): wiped = BlueZ bonds, committed +
-// candidate wifi.conf/vpn.conf, state.json. Surviving = identity.json
-// + device-secret — the setup code and printed label stay valid.
+// candidate wifi.conf and vpn.conf, state.json. Surviving =
+// identity.json + device-secret — the setup code, console password
+// and AP passphrase are derived from those two, so the printed label
+// stays valid (critique R3-1: the secret is NEVER deleted).
 func factoryReset() {
 	for _, p := range []string{wifiPath, vpnPath, wgConfigPath, ownerJSONPath} {
 		_ = os.Remove(p)
@@ -123,12 +158,14 @@ func factoryReset() {
 			_ = os.RemoveAll(filepath.Join(bluetoothStateDir, e.Name()))
 		}
 	}
+	clearPortalPause()
 	clearPairingFailures()
 	store.mu.Lock()
 	store.st = State{State: "factory_reset"}
 	store.txPhase = ""
+	store.uplinkDNS = ""
 	store.mu.Unlock()
-	store.persist()
+	store.persist() // state.json restarts as a fresh counters-only doc
 }
 
 // unbondAll removes all BlueZ pairings for the adapter and clears the
@@ -147,8 +184,8 @@ func unbondAll() {
 }
 
 // buildDiagnostics (§F4): /etc/homesteadlink/diag.tar.gz with the last
-// 24 h of hsl journal, state.json (secrets are never in it by
-// construction), `nft list ruleset` and `tailscale status`.
+// 24 h of hsl journal, state.json (config + counters only — no
+// secrets by construction), `nft list ruleset` and `tailscale status`.
 func buildDiagnostics() error {
 	files := map[string][]byte{}
 	if out, err := exec.Command("journalctl", "-u", "hsl-provisiond", "-u", "hsl-bt-attach", "-u", "hsl-firstboot",
@@ -189,5 +226,3 @@ func buildDiagnostics() error {
 	}
 	return writeFileAtomic(diagPath, buf.Bytes(), 0o600)
 }
-
-var _ = strings.TrimSpace // reserved for future redaction passes
