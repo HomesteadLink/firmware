@@ -1,0 +1,18 @@
+[Unit]
+Description=HomeSteadyLink UWE5622 Bluetooth attach (sprd, /dev/ttyS1)
+After=dev-ttyS1.device
+Wants=dev-ttyS1.device
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# UWE5622 BT is a UART (sprd) device: btattach with the sprd-compatible
+# H4 path; hciattach fallback variant for older Armbian userspace.
+# Success condition is /sys/class/bluetooth/hci0 existing (§F2).
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do if [ -e /sys/class/bluetooth/hci0 ]; then exit 0; fi; btattach -B /dev/ttyS1 -P sprd 2>/dev/null || btattach -B /dev/ttyS1 -P h4 2>/dev/null || hciattach /dev/ttyS1 sprd 2>/dev/null || hciattach /dev/ttyS1 any 2>/dev/null || true; for j in 1 2 3 4; do [ -e /sys/class/bluetooth/hci0 ] && exit 0; sleep 0.5; done; sleep 2; done; [ -e /sys/class/bluetooth/hci0 ]'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

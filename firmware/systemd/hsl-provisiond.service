@@ -1,0 +1,18 @@
+[Unit]
+Description=HomeSteadyLink provisioning daemon (BLE GATT + Wi-Fi/VPN)
+After=bluetooth.service hsl-bt-attach.service hsl-firstboot.service network.target
+Wants=bluetooth.service hsl-firstboot.service
+Requires=hsl-bt-attach.service
+
+[Service]
+Type=simple
+ExecStart=/opt/homesteadlink/bin/hsl-provisiond
+Restart=on-failure
+RestartSec=3
+SyslogIdentifier=hsl-provisiond
+# The daemon drives wpa_supplicant, systemctl, nft, wg/tailscale CLIs.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

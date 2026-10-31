@@ -1,0 +1,12 @@
+[Unit]
+Description=HomeSteadyLink first boot identity (serial + setup code)
+Before=hsl-provisiond.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/homesteadlink/bin/hsl-firstboot.sh
+
+[Install]
+WantedBy=multi-user.target

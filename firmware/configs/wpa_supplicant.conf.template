@@ -1,0 +1,11 @@
+# wpa_supplicant template — hsl-provisiond renders the live config from the
+# committed /etc/homesteadlink/wifi.conf; this template documents the shape.
+ctrl_interface=DIR=/run/wpa_supplicant GROUP=netdev
+update_config=0
+country={{COUNTRY}}
+
+network={
+	ssid="{{SSID}}"
+	psk="{{PSK}}"
+	# scan_ssid=1   # only when the network is hidden
+}
