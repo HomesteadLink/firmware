@@ -27,9 +27,9 @@ import (
 // out for 15 min (journal-logged); a successful auth resets the
 // counter. Availability: binds 192.168.64.1:8080 whenever provisiond
 // runs (NOT pre-setup-only) and 192.168.65.1:8080 while AP mode is
-// active. POST endpoints additionally accept the token as a form /
-// JSON field so the served HTML form can be submitted from a
-// browser; the failure counting applies identically.
+// active. The token travels ONLY in the X-HSL-Token header (§F5 +
+// §F8 item 11) — never as a form or JSON field (N9); the served
+// form submits via a script that sets the header.
 
 type tokenGate struct {
 	mu       sync.Mutex
@@ -49,7 +49,7 @@ func sourceIP(r *http.Request) string {
 
 // checkToken validates the request's token. A failure is counted;
 // the 5th failure from one IP locks it for 15 min.
-func (g *tokenGate) checkToken(r *http.Request, formToken string) bool {
+func (g *tokenGate) checkToken(r *http.Request) bool {
 	if identity.ConsolePass == "" {
 		return false
 	}
@@ -61,7 +61,7 @@ func (g *tokenGate) checkToken(r *http.Request, formToken string) bool {
 	}
 	g.mu.Unlock()
 
-	ok := r.Header.Get("X-HSL-Token") == identity.ConsolePass || formToken == identity.ConsolePass
+	ok := r.Header.Get("X-HSL-Token") == identity.ConsolePass // header ONLY (§F8 item 11)
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -78,8 +78,8 @@ func (g *tokenGate) checkToken(r *http.Request, formToken string) bool {
 	return false
 }
 
-func (g *tokenGate) require(w http.ResponseWriter, r *http.Request, formToken string) bool {
-	if g.checkToken(r, formToken) {
+func (g *tokenGate) require(w http.ResponseWriter, r *http.Request) bool {
+	if g.checkToken(r) {
 		return true
 	}
 	w.Header().Set("Content-Type", "text/plain")
@@ -92,7 +92,7 @@ func apFallbackServer() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		if !pageGate.require(w, r, "") {
+		if !pageGate.require(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -100,7 +100,7 @@ func apFallbackServer() {
 	})
 
 	mux.HandleFunc("/diagnostics", func(w http.ResponseWriter, r *http.Request) {
-		if !pageGate.require(w, r, "") {
+		if !pageGate.require(w, r) {
 			return
 		}
 		if _, err := os.Stat(diagPath); err != nil {
@@ -119,23 +119,16 @@ func apFallbackServer() {
 			return
 		}
 		var p WifiConfigPayload
-		token := ""
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			var body struct {
-				WifiConfigPayload
-				Token string `json:"token"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			p, token = body.WifiConfigPayload, body.Token
+			_ = json.NewDecoder(r.Body).Decode(&p)
 		} else {
 			_ = r.ParseForm()
 			p.SSID = r.FormValue("ssid")
 			p.PSK = r.FormValue("psk")
 			p.Country = r.FormValue("country")
 			p.Hidden = r.FormValue("hidden") == "on"
-			token = r.FormValue("token")
 		}
-		if !pageGate.require(w, r, token) {
+		if !pageGate.require(w, r) {
 			return
 		}
 		payload, _ := json.Marshal(p)
@@ -161,16 +154,13 @@ func apFallbackServer() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		var body struct {
-			VpnConfigPayload
-			Token string `json:"token"`
-		}
+		var body VpnConfigPayload
 		raw, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(raw, &body)
-		if !pageGate.require(w, r, body.Token) {
+		if !pageGate.require(w, r) {
 			return
 		}
-		payload, _ := json.Marshal(body.VpnConfigPayload)
+		payload, _ := json.Marshal(body)
 		if _, code := stageVpnConfig(payload); code != "" {
 			store.update(func(s *State) { s.Error = code })
 			http.Error(w, "vpn config invalid: "+code, http.StatusBadRequest)
@@ -190,7 +180,7 @@ func apFallbackServer() {
 			http.NotFound(w, r)
 			return
 		}
-		if !pageGate.require(w, r, "") {
+		if !pageGate.require(w, r) {
 			return
 		}
 		st := store.get()
@@ -198,14 +188,30 @@ func apFallbackServer() {
 		_, _ = w.Write([]byte(`<html><head><title>HomeSteadyLink setup</title></head><body>
 <h1>HomeSteadyLink setup</h1>
 <p>State: ` + st.State + `</p>
-<form method="post" action="/wifi">
-<label>Console-password token<br><input name="token" type="password" required></label><br><br>
-<label>Wi-Fi name (SSID)<br><input name="ssid" required></label><br><br>
-<label>Wi-Fi password<br><input name="psk" type="password"></label><br><br>
-<label>Country (2-letter)<br><input name="country" size="2"></label><br><br>
-<label><input type="checkbox" name="hidden"> Hidden network</label><br><br>
+<form id="f">
+<label>Console-password token<br><input id="token" type="password" required></label><br><br>
+<label>Wi-Fi name (SSID)<br><input id="ssid" required></label><br><br>
+<label>Wi-Fi password<br><input id="psk" type="password"></label><br><br>
+<label>Country (2-letter)<br><input id="country" size="2"></label><br><br>
+<label><input id="hidden" type="checkbox"> Hidden network</label><br><br>
 <button type="submit">Join</button>
-</form></body></html>`))
+</form>
+<p id="msg"></p>
+<script>
+// The token travels ONLY in the X-HSL-Token header (§F8 item 11),
+// so the form submits via fetch with the header set — never as a
+// form field.
+document.getElementById('f').addEventListener('submit', function(e){
+  e.preventDefault();
+  fetch('/wifi', {method: 'POST',
+    headers: {'X-HSL-Token': document.getElementById('token').value, 'Content-Type': 'application/json'},
+    body: JSON.stringify({ssid: document.getElementById('ssid').value,
+      psk: document.getElementById('psk').value,
+      country: document.getElementById('country').value,
+      hidden: document.getElementById('hidden').checked})
+  }).then(function(r){ return r.text(); }).then(function(t){ document.getElementById('msg').textContent = t; });
+});
+</script></body></html>`))
 	})
 
 	// Availability (§F5): 192.168.64.1 whenever the daemon runs;

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"strconv"
 	"strings"
 	"sync"
@@ -424,6 +425,26 @@ func portalPassActive() bool {
 	return passActive
 }
 
+// chownPassLog hands the pass log to the dnsmasq user (§F4 step
+// (2b): provisiond pre-creates dnsmasq-pass.log, owner dnsmasq,
+// mode 0644). dnsmasq appends its query log as that user — a
+// root-owned file silently kills the admission channel (N6).
+func chownPassLog() {
+	u, err := user.Lookup("dnsmasq")
+	if err != nil {
+		log.Printf("portal_pass: dnsmasq user lookup failed: %v (pass log stays root-owned)", err)
+		return
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	if err := os.Chown(passLogPath, uid, gid); err != nil {
+		log.Printf("portal_pass: chown %s to dnsmasq failed: %v", passLogPath, err)
+	}
+}
+
 // portalPassGrant opens the 10-minute pass. Gate (caller-enforced
 // and re-checked here): state captive_portal and no pass active.
 // Steps (§F4): resolve the check host + redirect target through the
@@ -478,6 +499,7 @@ func portalPassGrant() {
 	// the pass-only config file; removed again at expiry.
 	_ = os.MkdirAll("/run/homesteadlink", 0o755)
 	_ = os.WriteFile(passLogPath, nil, 0o644)
+	chownPassLog()
 	if dns != "" {
 		conf := "server=" + dns + "\nlog-queries\nlog-facility=" + passLogPath + "\n"
 		if err := writeFileAtomic(passConfPath, []byte(conf), 0o644); err != nil {
@@ -611,6 +633,7 @@ func portalPassExpire() {
 	_ = exec.Command("nft", "flush", "chain", "inet", "hsl_filter", "portal_pass").Run()
 	_ = os.Remove(passConfPath)
 	_ = os.WriteFile(passLogPath, nil, 0o644)
+	chownPassLog()
 	_ = exec.Command("systemctl", "restart", "dnsmasq.service").Run()
 	log.Printf("portal_pass: expired — chain flushed, pass DNS removed, dnsmasq restarted")
 }

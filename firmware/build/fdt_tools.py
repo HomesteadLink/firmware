@@ -254,7 +254,66 @@ def assert_merged(base):
     return "PASS"
 
 
+USB_FRAGMENTS = (
+    # (symbol, props) — mirrors boards/orangepizero2w/usb0-device.dts,
+    # written by the board plugin's board_apply_dts_overlay().
+    ("usbotg", (("dr_mode", "peripheral"), ("status", "okay"))),
+    ("usbphy", (("status", "okay"),)),
+    ("ehci0", (("status", "disabled"),)),
+    ("ohci0", (("status", "disabled"),)),
+)
+
+
+def make_usb_overlay(base):
+    sym = symbols(base)
+    w = Writer()
+    w.begin("")
+    w.prop("compatible", cstring("allwinner,sun50i-h616") + cstring("allwinner,sun50i-h618"))
+    for i, (label, props) in enumerate(USB_FRAGMENTS):
+        path = sym.get(label)
+        node = base.find(path) if path else None
+        if node is None:
+            raise SystemExit("base DTB has no %s node (%s)" % (label, path))
+        ph = node_phandle(node)
+        if ph is None:
+            raise SystemExit("%s node has no phandle in base DTB" % label)
+        w.begin("fragment@%d" % i)
+        w.prop("target", u32(ph))
+        w.begin("__overlay__")
+        for name, val in props:
+            w.prop(name, cstring(val))
+        w.end_node()
+        w.end_node()
+    return w.blob()
+
+
+def assert_usb_merged(base):
+    sym = symbols(base)
+    for label, props in USB_FRAGMENTS:
+        path = sym.get(label)
+        node = base.find(path) if path else None
+        if node is None:
+            return "FAIL: no %s node (%s)" % (label, path)
+        for name, want in props:
+            got = prop_str(node, name)
+            if got != want:
+                return "FAIL: %s %s=%r, want %r" % (label, name, got, want)
+    return "PASS"
+
+
 def main(argv):
+    if argv[1] == "make-usb-overlay":
+        base = parse_fdt(open(argv[2], "rb").read())
+        open(argv[3], "wb").write(make_usb_overlay(base))
+        print("usb overlay written:", argv[3])
+        return 0
+    if argv[1] == "assert-usb":
+        base = parse_fdt(open(argv[2], "rb").read())
+        overlay = parse_fdt(open(argv[3], "rb").read())
+        merged = apply_overlay(base, overlay)
+        result = assert_usb_merged(merged)
+        print("merged-DT usb assertion (§F1 gadget):", result)
+        return 0 if result == "PASS" else 1
     if argv[1] == "make-overlay":
         base = parse_fdt(open(argv[2], "rb").read())
         open(argv[3], "wb").write(make_overlay(base))

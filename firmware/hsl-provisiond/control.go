@@ -145,12 +145,27 @@ func (s *gattServer) disconnectAllCentrals() {
 // identity.json + device-secret — the setup code, console password
 // and AP passphrase are derived from those two, so the printed label
 // stays valid (critique R3-1: the secret is NEVER deleted).
-func factoryReset() {
-	for _, p := range []string{wifiPath, vpnPath, wgConfigPath, ownerJSONPath} {
+// wipeConfigState is the ONE wipe routine for the BLE factory
+// reset; the HSL-RESET path in hsl-firstboot.sh performs the same
+// wipe in shell (it removes live/ entirely). Committed + candidate
+// wifi.conf/vpn.conf AND the whole live/ render directory go:
+// live/wpa_supplicant.conf and live/wg-hsl.conf are derived copies
+// of exactly the committed files — leaving live/wpa_supplicant.conf
+// behind let wpa_supplicant@wlan0 rejoin a supposedly wiped
+// network (N4). identity.json + device-secret are NEVER touched:
+// the printed label stays valid.
+func wipeConfigState() {
+	for _, p := range []string{wifiPath, vpnPath, ownerJSONPath} {
 		_ = os.Remove(p)
 	}
+	_ = os.RemoveAll(liveDir)
+	_ = os.MkdirAll(liveDir, 0o755)
 	_ = os.RemoveAll(candidateDir)
 	_ = os.MkdirAll(candidateDir, 0o755)
+}
+
+func factoryReset() {
+	wipeConfigState()
 	// Bonds: remove via bluetoothctl AND clear the BlueZ store.
 	unbondAll()
 	if entries, err := os.ReadDir(bluetoothStateDir); err == nil {

@@ -881,6 +881,29 @@ func committedSSID() string {
 var apMu sync.Mutex
 var apOn bool
 
+// setAPInputRules manages the ap_input chain (§F4, N11): the
+// wlan0 service accepts (DHCP, DNS, config page) exist ONLY while
+// AP mode is on; in STA mode all other wlan0 input is dropped.
+// The static ruleset jumps wlan0 input to the empty-by-default
+// ap_input chain; provisiond is its only writer — populated on AP
+// entry, flushed on AP exit.
+func setAPInputRules(on bool) {
+	if !on {
+		_ = exec.Command("nft", "flush", "chain", "inet", "hsl_filter", "ap_input").Run()
+		return
+	}
+	snippet := "flush chain inet hsl_filter ap_input\n" +
+		"add rule inet hsl_filter ap_input udp dport 67 accept\n" +
+		"add rule inet hsl_filter ap_input udp dport 53 accept\n" +
+		"add rule inet hsl_filter ap_input tcp dport 53 accept\n" +
+		"add rule inet hsl_filter ap_input tcp dport 8080 accept\n"
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(snippet)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("AP mode: nft ap_input populate failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+}
+
 func apModeOn() bool {
 	apMu.Lock()
 	defer apMu.Unlock()
@@ -915,6 +938,7 @@ func startAPMode(reason string) {
 	if out, err := exec.Command("systemctl", "start", "hostapd.service").CombinedOutput(); err != nil {
 		log.Printf("AP fallback: hostapd start failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+	setAPInputRules(true) // §F4: wlan0 accepts exist only in AP mode
 }
 
 // stopAPMode reverses the §F5 switch (AP → STA): stop hostapd,
@@ -929,6 +953,7 @@ func stopAPMode() {
 	apOn = false
 	apMu.Unlock()
 	log.Printf("AP fallback stopping — returning wlan0 to STA mode")
+	setAPInputRules(false) // §F4: back in STA mode wlan0 input drops
 	_ = exec.Command("systemctl", "stop", "hostapd.service").Run()
 	_ = os.Remove("/etc/dnsmasq.d/dnsmasq-ap.conf")
 	_ = exec.Command("systemctl", "restart", "dnsmasq.service").Run()

@@ -8,7 +8,7 @@ package main
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
+	"fmt"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -93,18 +93,20 @@ func boardSerial() string {
 	return strings.Trim(strings.TrimSpace(string(b)), "\x00")
 }
 
+// loadDeviceSecret is READ-ONLY (§F1 / §F8 item 10(xvii)):
+// device-secret creation belongs to hsl-firstboot ONLY. provisiond
+// never creates or rewrites it — a missing/short secret is a loud
+// error, not a silent regeneration (a regenerated secret would
+// silently move every derived credential away from the label).
 func loadDeviceSecret() ([]byte, error) {
-	if b, err := os.ReadFile(deviceSecretPath); err == nil && len(b) >= 16 {
-		return b, nil
-	}
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
+	b, err := os.ReadFile(deviceSecretPath)
+	if err != nil {
 		return nil, err
 	}
-	if err := writeFileAtomic(deviceSecretPath, secret, 0o600); err != nil {
-		return nil, err
+	if len(b) < 16 {
+		return nil, fmt.Errorf("device-secret too short: %d bytes", len(b))
 	}
-	return secret, nil
+	return b, nil
 }
 
 func hmacSHA256(secret []byte, msg string) []byte {
@@ -155,10 +157,12 @@ func padInt(n, width int) string {
 }
 
 // loadIdentity implements §F1: identity follows the BOARD.
-// identity.json is regenerated whenever the board serial differs from
-// the stored one (a cloned card takes the new board's identity); with
-// no board serial, a persisted random 128-bit value is the serial and
-// is never re-derived or regenerated (it survives factory reset).
+// READ-ONLY (§F8 item 10(xvii)): identity.json + device-secret are
+// created and persisted by hsl-firstboot ONLY (it runs every boot,
+// Before=hsl-provisiond.service). provisiond derives the same
+// pinned values in memory from the persisted secret + serial and
+// writes NOTHING: no identity creation, no rewrite on board-serial
+// change (firstboot's next run owns that), no random fallback.
 func loadIdentity() Identity {
 	stored := Identity{}
 	if b, err := os.ReadFile(identityPath); err == nil {
@@ -169,28 +173,19 @@ func loadIdentity() Identity {
 		serial = stored.Serial
 	}
 	if serial == "" {
-		raw := make([]byte, 16) // random 128-bit fallback, generated once
-		if _, err := rand.Read(raw); err == nil {
-			serial = hex.EncodeToString(raw)
-		}
+		log.Printf("identity: ERROR — no board serial and no persisted identity.json; hsl-firstboot has not created an identity and provisiond will not invent one (§F8 10(xvii))")
 	}
 	secret, err := loadDeviceSecret()
 	if err != nil {
 		log.Printf("identity: device secret unavailable: %v", err)
 		return Identity{Serial: serial, SetupCode: stored.SetupCode}
 	}
-	id := Identity{
+	return Identity{
 		Serial:       serial,
 		SetupCode:    setupCodeFor(secret, serial),
 		ConsolePass:  consolePasswordFor(secret, serial),
 		APPassphrase: apPassphraseFor(secret, serial),
 	}
-	if stored != id {
-		if b, err := json.Marshal(id); err == nil {
-			_ = writeFileAtomic(identityPath, append(b, '\n'), 0o600)
-		}
-	}
-	return id
 }
 
 func last4(s string) string {

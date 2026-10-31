@@ -10,4 +10,27 @@ SERIAL=$(sed -n 's/.*"serial":"\([^"]*\)".*/\1/p' "$ID" | head -1)
 CODE=$(sed -n 's/.*"setup_code":"\([^"]*\)".*/\1/p' "$ID" | head -1)
 CONSOLE=$(sed -n 's/.*"console_password":"\([^"]*\)".*/\1/p' "$ID" | head -1)
 AP_PASS=$(sed -n 's/.*"ap_passphrase":"\([^"]*\)".*/\1/p' "$ID" | head -1)
+# Fallback (§F1): if identity.json lacks a field, derive it from the
+# device-secret exactly as hsl-firstboot does (HMAC-SHA256 keyed by
+# the secret, domain-separated messages). Root-only: the secret is
+# 0600 root, so only root gets the real values.
+SECRET_FILE=/etc/homesteadlink/device-secret
+if [ -s "$SECRET_FILE" ] && { [ -z "$CONSOLE" ] || [ -z "$AP_PASS" ] || [ -z "$CODE" ]; }; then
+  SECRET_HEX=$(od -An -tx1 "$SECRET_FILE" | tr -d ' \n')
+  hmac_int() {
+    _digest=$(printf '%s' "$1" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SECRET_HEX" -binary | od -An -tx1 | tr -d ' \n')
+    _prefix=$(printf '%s' "$_digest" | cut -c1-"$2")
+    printf '%s' "$_prefix" | awk -v mod="$3" '{
+      n = 0
+      for (i = 1; i <= length($0); i++) {
+        d = index("0123456789abcdef", tolower(substr($0, i, 1))) - 1
+        n = (n * 16 + d) % mod
+      }
+      printf "%d", n
+    }'
+  }
+  [ -n "$CODE" ] || CODE=$(printf '%06d' "$(hmac_int "$SERIAL" 6 1000000)")
+  [ -n "$CONSOLE" ] || CONSOLE="HSL-$(printf '%08d' "$(hmac_int "$SERIAL:console" 8 100000000)")"
+  [ -n "$AP_PASS" ] || AP_PASS=$(printf '%012d' "$(hmac_int "$SERIAL:ap" 10 1000000000000)")
+fi
 echo "HSL-IDENTITY serial=$SERIAL setup_code=$CODE console_password=$CONSOLE ap_passphrase=$AP_PASS"

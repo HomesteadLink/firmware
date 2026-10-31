@@ -39,6 +39,8 @@ sha256sum homesteadlink-orangepizero2w-<date>.img.xz   # compare with the publis
    until Wi-Fi is configured). Provision from the app, or join the
    `HomesteadLink-<last4>` AP and open `http://192.168.64.1:8080`
    (usb0) or `http://192.168.65.1:8080` (AP mode). The AP passphrase
-   is an independent per-device secret in `identity.json`
-   (`ap_passphrase`, from /dev/urandom) — it is NOT derived from the
-   setup code or serial.
+   is in `identity.json` (`ap_passphrase`): the §F1 domain-
+   separated derivation — first 5 bytes of HMAC-SHA256(key =
+   device-secret, message = serial + ":ap") mod 10^12, 12 digits.
+   Independent of the setup code (different HMAC domain); the
+   device-secret is its only secret input.

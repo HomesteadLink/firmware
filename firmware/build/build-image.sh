@@ -15,7 +15,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FW=$(dirname "$HERE")
 OUT_DIR=${OUT_DIR:-"$HERE/out"}
-OUT_NAME=${OUT_NAME:-"homesteadlink-v1.1-orangepizero2w.img.xz"}
+OUT_NAME=${OUT_NAME:-"homesteadlink-v1.2-orangepizero2w.img.xz"}
 WORK=${WORK:-"$HERE/work"}
 ARMBIAN_URL=${ARMBIAN_URL:-"https://archive.armbian.com/orangepizero2w/archive/Armbian_25.5.1_Orangepizero2w_noble_current_6.12.23.img.xz"}
 PKGS="dnsmasq hostapd nftables"
@@ -172,7 +172,8 @@ MISSING=""
 for sym in CONFIG_BT CONFIG_BT_HCIUART CONFIG_BT_HCIUART_H4 CONFIG_RFKILL \
            CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_TUN \
            CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_USB_CONFIGFS_ECM \
-           CONFIG_USB_CONFIGFS_NCM CONFIG_USB_CONFIGFS_ACM CONFIG_NF_NAT CONFIG_NF_TABLES; do
+           CONFIG_USB_CONFIGFS_NCM CONFIG_USB_CONFIGFS_ACM CONFIG_NF_NAT CONFIG_NF_TABLES \
+           CONFIG_USB_CONFIGFS_RNDIS CONFIG_NFT_MASQ CONFIG_NFT_CT CONFIG_NF_CONNTRACK; do
   if ! grep -qE "^${sym}=(y|m)" "$KCFG"; then MISSING="$MISSING $sym"; fi
 done
 # §F3 pins CONFIG_WIREGUARD=m exactly (F18).
@@ -204,6 +205,23 @@ else
   cat "$WORK/dt-assertion.txt" | sed 's/^/[build-image] /' >&2
   fail "merged-DT assertion failed (F1/F2 hard gate) — see $WORK/dt-assertion.txt"
 fi
+# §F1 gadget overlay: usb0-device.dtbo (board plugin's
+# board_apply_dts_overlay: usbotg dr_mode=peripheral, ehci0/ohci0
+# disabled) — same hard-gate discipline as bt-uart.
+USBDTBO="$WORK/usb0-device.dtbo"
+if command -v dtc >/dev/null 2>&1; then
+  dtc -@ -I dts -O dtb -o "$USBDTBO" "$FW/boards/orangepizero2w/usb0-device.dts" || fail "dtc failed on usb0-device.dts"
+  log "usb0-device.dtbo compiled with dtc from boards/orangepizero2w/usb0-device.dts"
+else
+  python3 "$HERE/fdt_tools.py" make-usb-overlay "$DTB" "$USBDTBO" || fail "fdt_tools make-usb-overlay failed"
+  log "usb0-device.dtbo generated with fdt_tools.py (no dtc on host; same nodes as usb0-device.dts)"
+fi
+if python3 "$HERE/fdt_tools.py" assert-usb "$DTB" "$USBDTBO" > "$WORK/dt-usb-assertion.txt" 2>&1; then
+  cat "$WORK/dt-usb-assertion.txt" | sed 's/^/[build-image] /'
+else
+  cat "$WORK/dt-usb-assertion.txt" | sed 's/^/[build-image] /' >&2
+  fail "merged-DT usb assertion failed (§F1 gadget gate) — see $WORK/dt-usb-assertion.txt"
+fi
 # armbianEnv.txt: enable bt-uart via user_overlays (host-side edit;
 # injected below in both modes).
 ENV_FILE="$WORK/armbianEnv.new"
@@ -213,9 +231,11 @@ elif [ ! -s "$ENV_FILE" ]; then
   cp "$WORK/armbianEnv.txt" "$ENV_FILE" 2>/dev/null || : > "$ENV_FILE"
 fi
 if grep -q '^user_overlays=' "$ENV_FILE"; then
-  grep -qE '^user_overlays=.*\bbt-uart\b' "$ENV_FILE" || sed -i 's/^user_overlays=.*/& bt-uart/' "$ENV_FILE"
+  for ov in bt-uart usb0-device; do
+    grep -qE "^user_overlays=.*\\b$ov\\b" "$ENV_FILE" || sed -i "s/^user_overlays=.*/& $ov/" "$ENV_FILE"
+  done
 else
-  printf "user_overlays=bt-uart\n" >> "$ENV_FILE"
+  printf "user_overlays=bt-uart usb0-device\n" >> "$ENV_FILE"
 fi
 log "armbianEnv user_overlays: $(grep '^user_overlays=' "$ENV_FILE")"
 
@@ -274,6 +294,9 @@ stage_file() { # src dest mode
 stage_file "$BIN" /opt/homesteadlink/bin/hsl-provisiond 755
 stage_file "$FW/systemd/hsl-firstboot.sh" /opt/homesteadlink/bin/hsl-firstboot.sh 755
 stage_file "$FW/systemd/hsl-setup-code" /usr/local/sbin/hsl-setup-code 755
+stage_file "$FW/systemd/setup-usb-gadget.sh" /usr/local/sbin/setup-usb-gadget.sh 755
+stage_file "$FW/systemd/usb-gadget.service" /etc/systemd/system/usb-gadget.service 644
+stage_file "$USBDTBO" /boot/overlay-user/usb0-device.dtbo 644
 stage_file "$FW/VERSION" /opt/homesteadlink/VERSION 644
 for u in hsl-bt-attach.service hsl-firstboot.service hsl-provisiond.service; do
   stage_file "$FW/systemd/$u" "/etc/systemd/system/$u" 644
@@ -313,8 +336,35 @@ if [ "$MODE" = "loop" ]; then
   enable_unit() { mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"; ln -sf "../$1" "$ROOT/etc/systemd/system/multi-user.target.wants/$1"; }
   enable_unit hsl-bt-attach.service; enable_unit hsl-firstboot.service; enable_unit hsl-provisiond.service
   enable_unit nftables.service; enable_unit dnsmasq.service; enable_unit tailscaled.service
+  enable_unit usb-gadget.service
   ln -sf "/lib/systemd/system/wpa_supplicant@.service" "$ROOT/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service"
-  mkdir -p "$ROOT/etc/systemd/system/systemd-networkd.service.wants" 2>/dev/null || true
+  # §F1 (N1): systemd-networkd enabled — wants link + socket +
+  # the network1 D-Bus alias, exactly as systemctl enable writes.
+  ln -sf "/lib/systemd/system/systemd-networkd.service" "$ROOT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+  mkdir -p "$ROOT/etc/systemd/system/sockets.target.wants"
+  ln -sf "/lib/systemd/system/systemd-networkd.socket" "$ROOT/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"
+  ln -sf "/lib/systemd/system/systemd-networkd.service" "$ROOT/etc/systemd/system/dbus-org.freedesktop.network1.service"
+  # §F1: serial console on the gadget ACM port.
+  mkdir -p "$ROOT/etc/systemd/system/getty.target.wants"
+  ln -sf "/lib/systemd/system/serial-getty@.service" "$ROOT/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service"
+  # §F1 (N1): the stock netplan NetworkManager renderer must not
+  # fight a masked NetworkManager — networkd owns the interfaces.
+  rm -f "$ROOT/etc/netplan/00-default-use-network-manager.yaml"
+  # ENABLEMENT assertions (loop mode): links, not just files (N1).
+  for l in /etc/systemd/system/multi-user.target.wants/systemd-networkd.service \
+           /etc/systemd/system/sockets.target.wants/systemd-networkd.socket \
+           /etc/systemd/system/dbus-org.freedesktop.network1.service \
+           /etc/systemd/system/multi-user.target.wants/usb-gadget.service \
+           /etc/systemd/system/multi-user.target.wants/hsl-bt-attach.service \
+           /etc/systemd/system/multi-user.target.wants/hsl-firstboot.service \
+           /etc/systemd/system/multi-user.target.wants/hsl-provisiond.service \
+           /etc/systemd/system/multi-user.target.wants/dnsmasq.service \
+           /etc/systemd/system/bluetooth.target.wants/bluetooth.service \
+           /etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service; do
+    [ -L "$ROOT$l" ] || fail "enablement assertion (loop): $l missing (N1)"
+  done
+  [ ! -e "$ROOT/etc/netplan/00-default-use-network-manager.yaml" ] || fail "enablement assertion (loop): netplan NM renderer still present (N1)"
+  log "enablement assertions passed (loop mode, N1)"
   ln -sf /dev/null "$ROOT/etc/systemd/system/ssh.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/sshd.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/NetworkManager.service"
@@ -347,9 +397,21 @@ else
     echo "symlink $rel $tgt" >> "$CMDS"
   done
   # enablement + masks as symlinks
-  for u in hsl-bt-attach.service hsl-firstboot.service hsl-provisiond.service nftables.service dnsmasq.service tailscaled.service; do
+  for u in hsl-bt-attach.service hsl-firstboot.service hsl-provisiond.service nftables.service dnsmasq.service tailscaled.service usb-gadget.service; do
     echo "symlink /etc/systemd/system/multi-user.target.wants/$u ../$u" >> "$CMDS"
   done
+  # §F1 (N1): systemd-networkd enablement — multi-user wants link,
+  # sockets.target wants link for the activation socket, and the
+  # dbus-org.freedesktop.network1.service Alias link, exactly as
+  # systemctl enable systemd-networkd writes them.
+  echo "symlink /etc/systemd/system/multi-user.target.wants/systemd-networkd.service /lib/systemd/system/systemd-networkd.service" >> "$CMDS"
+  echo "symlink /etc/systemd/system/sockets.target.wants/systemd-networkd.socket /lib/systemd/system/systemd-networkd.socket" >> "$CMDS"
+  echo "symlink /etc/systemd/system/dbus-org.freedesktop.network1.service /lib/systemd/system/systemd-networkd.service" >> "$CMDS"
+  # §F1: serial console on the gadget ACM port (board plugin parity).
+  echo "symlink /etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service /lib/systemd/system/serial-getty@.service" >> "$CMDS"
+  # §F1 (N1): remove the stock netplan NetworkManager renderer —
+  # NetworkManager is masked; networkd owns usb0/wlan0.
+  echo "rm /etc/netplan/00-default-use-network-manager.yaml" >> "$CMDS"
   echo "symlink /etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service /lib/systemd/system/wpa_supplicant@.service" >> "$CMDS"
   echo "symlink /etc/systemd/system/ssh.service /dev/null" >> "$CMDS"
   echo "symlink /etc/systemd/system/sshd.service /dev/null" >> "$CMDS"
@@ -374,6 +436,32 @@ else
   assert_stat /etc/systemd/network/30-wlan0.network
   debugfs -R "stat /root/.not_logged_in_yet" "$ROOTPART_IMG" 2>/dev/null | grep -q "Inode:" && fail "artifact assertion: Armbian first-login trigger still present (§F1)"
   debugfs -R "stat /etc/systemd/system/multi-user.target.wants/hsl-provisiond.service" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: symlink" || fail "artifact assertion: hsl-provisiond.service not enabled"
+  # ENABLEMENT assertions (N1): wants/alias symlinks in the FINAL
+  # artifact for every spec'd unit — files-present assertions alone
+  # are what let the networkd/gadget/getty gap through last round.
+  assert_link() { debugfs -R "stat $1" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: symlink" || fail "enablement assertion: $1 is not an enablement symlink (N1)"; }
+  assert_link /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+  assert_link /etc/systemd/system/sockets.target.wants/systemd-networkd.socket
+  assert_link /etc/systemd/system/dbus-org.freedesktop.network1.service
+  assert_link /etc/systemd/system/multi-user.target.wants/usb-gadget.service
+  assert_link /etc/systemd/system/multi-user.target.wants/hsl-bt-attach.service
+  assert_link /etc/systemd/system/multi-user.target.wants/hsl-firstboot.service
+  assert_link /etc/systemd/system/multi-user.target.wants/hsl-provisiond.service
+  assert_link /etc/systemd/system/multi-user.target.wants/dnsmasq.service
+  assert_link /etc/systemd/system/bluetooth.target.wants/bluetooth.service
+  assert_link /etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
+  assert_stat /etc/systemd/system/usb-gadget.service
+  assert_stat /usr/local/sbin/setup-usb-gadget.sh
+  assert_stat /boot/overlay-user/usb0-device.dtbo
+  debugfs -R "stat /etc/netplan/00-default-use-network-manager.yaml" "$ROOTPART_IMG" 2>/dev/null | grep -q "Inode:" && fail "enablement assertion: netplan NetworkManager renderer still present (N1)"
+  debugfs -R "dump /boot/armbianEnv.txt $WORK/armbianEnv.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final armbianEnv.txt"
+  grep -q "usb0-device" "$WORK/armbianEnv.final" || fail "enablement assertion: armbianEnv user_overlays lacks usb0-device (N1)"
+  grep -q "bt-uart" "$WORK/armbianEnv.final" || fail "enablement assertion: armbianEnv user_overlays lacks bt-uart"
+  # hsl-setup-code in the artifact must be the fixed (N2) version:
+  # the identity line prints the AP passphrase variable, not a stub.
+  debugfs -R "dump /usr/local/sbin/hsl-setup-code $WORK/hsl-setup-code.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final hsl-setup-code"
+  grep -q 'ap_passphrase=$AP_PASS' "$WORK/hsl-setup-code.final" || fail "artifact assertion: shipped hsl-setup-code does not print the AP passphrase (N2)"
+  log "enablement assertions passed (N1: networkd+alias+socket, usb-gadget, getty, bluetooth, dnsmasq, hsl units)"
   debugfs -R "dump /var/lib/dpkg/status $WORK/dpkg-status.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final dpkg status"
   for p in $ASSERT_PKGS; do
     grep -q "^Package: $p\$" "$WORK/dpkg-status.final" || fail "dpkg assertion: package $p missing from final image status (F6)"

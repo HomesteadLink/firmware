@@ -616,6 +616,11 @@ func recordPairingFailure() {
 	trigger := n >= 5
 	if trigger {
 		store.lk.PairFailures = 0
+		// §F4 (N5): at 5 failures the failure window closes
+		// IMMEDIATELY — zero its countdown so the first failure
+		// after the lockout opens a fresh 60-min window instead
+		// of resuming the residual one.
+		store.lk.PairWindowRemainingS = 0
 		store.lk.LockoutCount++
 		dur := 900 << (store.lk.LockoutCount - 1)
 		if dur > 3600 {
@@ -679,6 +684,12 @@ var gattSrv *gattServer
 // stays `scanning` until results are ready or the 15 s timeout; a
 // scan during a join/VPN transaction is refused with error=busy.
 func (s *gattServer) triggerScan() {
+	if apModeOn() {
+		// §F4 WifiScan bullet (N3): in AP mode a scan is refused
+		// with error=busy — no scan is attempted, no scan object.
+		store.update(func(st *State) { st.Error = "busy" })
+		return
+	}
 	if isTxActive() {
 		store.update(func(st *State) { st.Error = "busy" })
 		return
@@ -779,6 +790,14 @@ func buildChars(s *gattServer) []*characteristic {
 				// error response + Status error=busy, nothing else.
 				store.update(func(st *State) { st.Error = "busy" })
 				return nil, dbus.NewError("org.bluez.Error.Failed", []interface{}{"scan refused: a join/VPN transaction is in progress (busy)"})
+			}
+			if apModeOn() {
+				// §F4 WifiScan bullet (N3): in AP mode wpa_supplicant
+				// is stopped — WifiScan is refused with error=busy,
+				// no scan is attempted and no scan object is returned
+				// (same discipline as the transaction-busy path).
+				store.update(func(st *State) { st.Error = "busy" })
+				return nil, dbus.NewError("org.bluez.Error.Failed", []interface{}{"scan refused: AP mode is active (busy)"})
 			}
 			s.triggerScan()
 			return s.lastScanValue(), nil

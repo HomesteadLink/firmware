@@ -1,0 +1,13 @@
+[Unit]
+Description=USB Gadget (ACM + ECM + RNDIS) bringup
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/setup-usb-gadget.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
