@@ -134,8 +134,10 @@ firmware before pairing.
 | `security` | string enum | `wpa2` \| `wpa3` \| `trans` (WPA2/3 transition) \| `eap` \| `open`. |
 | `secure` | boolean | `true` unless `security` is `open`. |
 
-Scan is refused with `error=busy` (Status) while a join/VPN
-transaction runs; it is allowed in idle and online. App-side rule:
+Scan is refused with `error=busy` (Status) in transaction states
+(wifi_joining, dhcp, internet_check, vpn_starting), in
+captive_portal, and in AP mode; it is allowed in idle, scanning,
+online, online_no_vpn, and vpn_failed. App-side rule:
 results are deduplicated by SSID (strongest RSSI shown); the device
 joins the strongest BSSID unless the user picks one, which sets
 `WifiConfig.bssid`.
