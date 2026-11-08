@@ -15,7 +15,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FW=$(dirname "$HERE")
 OUT_DIR=${OUT_DIR:-"$HERE/out"}
-OUT_NAME=${OUT_NAME:-"homesteadlink-v1.2-orangepizero2w.img.xz"}
+OUT_NAME=${OUT_NAME:-"homesteadlink-v1.3-orangepizero2w.img.xz"}
 WORK=${WORK:-"$HERE/work"}
 ARMBIAN_URL=${ARMBIAN_URL:-"https://archive.armbian.com/orangepizero2w/archive/Armbian_25.5.1_Orangepizero2w_noble_current_6.12.23.img.xz"}
 PKGS="dnsmasq hostapd nftables"
@@ -25,17 +25,33 @@ log() { echo "[build-image] $*"; }
 fail() { echo "[build-image] FAIL: $*" >&2; exit 1; }
 
 # --- 1. daemon binary (arm64, static, no cgo) ---
+# Provenance gate: the daemon must be built from a clean checkout at
+# the pinned commit (env HSL_PINNED_SHA); an uncommitted or dirty tree
+# ships no vcs stamp and its equivalence is unverifiable (firmware#9).
+[ -n "${HSL_PINNED_SHA:-}" ] || fail "HSL_PINNED_SHA not set: pinned-checkout provenance gate cannot run"
+BUILD_HEAD=$(git -C "$FW" rev-parse HEAD 2>/dev/null) || fail "provenance gate: $FW is not a git checkout"
+[ "$BUILD_HEAD" = "$HSL_PINNED_SHA" ] || fail "provenance gate: HEAD $BUILD_HEAD != HSL_PINNED_SHA $HSL_PINNED_SHA"
+[ -z "$(git -C "$FW" status --porcelain)" ] || fail "provenance gate: checkout at $FW is dirty"
+log "provenance gate passed: clean checkout at $BUILD_HEAD"
 BIN="$WORK/hsl-provisiond"
 if [ -n "${GO:-}" ] || command -v go >/dev/null 2>&1; then
   GO=${GO:-go}
   log "building hsl-provisiond with $GO"
   ( cd "$FW/hsl-provisiond" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$BIN" . )
-elif [ -f "$FW/hsl-provisiond/hsl-provisiond" ]; then
-  log "no Go toolchain: using prebuilt $FW/hsl-provisiond/hsl-provisiond"
-  cp "$FW/hsl-provisiond/hsl-provisiond" "$BIN"
 else
-  fail "no Go toolchain and no prebuilt daemon binary"
+  fail "no Go toolchain: prebuilt daemon fallback removed (firmware#9)"
 fi
+# Stamp gate: the built daemon must carry vcs stamps for the pinned
+# clean checkout. (No literal-content gate: this toolchain encodes
+# short strings as code immediates, so byte-grep cannot find them.)
+BIN_VCS=$("$GO" version -m "$BIN") || fail "stamp gate: go version -m failed on $BIN"
+echo "$BIN_VCS" | grep -qF "vcs.revision=$BUILD_HEAD" || fail "stamp gate: vcs.revision != $BUILD_HEAD in $BIN"
+echo "$BIN_VCS" | grep -qF "vcs.modified=false" || fail "stamp gate: vcs.modified is not false in $BIN"
+log "stamp gate passed: vcs.revision=$BUILD_HEAD vcs.modified=false"
+# Record the source SHA only AFTER the daemon build: $WORK may live
+# inside the checkout (default $HERE/work), and an untracked file
+# there would make Go stamp vcs.modified=true on the build above.
+printf "%s\n" "$BUILD_HEAD" > "$WORK/source-sha"
 file "$BIN" | grep -q "ARM aarch64" || fail "daemon binary is not aarch64: $(file "$BIN")"
 log "daemon: $(file "$BIN") size=$(stat -c %s "$BIN")"
 
@@ -298,6 +314,7 @@ stage_file "$FW/systemd/setup-usb-gadget.sh" /usr/local/sbin/setup-usb-gadget.sh
 stage_file "$FW/systemd/usb-gadget.service" /etc/systemd/system/usb-gadget.service 644
 stage_file "$USBDTBO" /boot/overlay-user/usb0-device.dtbo 644
 stage_file "$FW/VERSION" /opt/homesteadlink/VERSION 644
+stage_file "$WORK/source-sha" /opt/homesteadlink/SOURCE_SHA 644
 for u in hsl-bt-attach.service hsl-firstboot.service hsl-provisiond.service; do
   stage_file "$FW/systemd/$u" "/etc/systemd/system/$u" 644
 done
@@ -369,6 +386,14 @@ if [ "$MODE" = "loop" ]; then
   ln -sf /dev/null "$ROOT/etc/systemd/system/sshd.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/NetworkManager.service"
   rm -f "$ROOT/root/.not_logged_in_yet" # §F1: Armbian first-login flow disabled
+  # Final-artifact gates (loop): SOURCE_SHA content + daemon identity.
+  [ -f "$ROOT/opt/homesteadlink/SOURCE_SHA" ] || fail "artifact gate (loop): /opt/homesteadlink/SOURCE_SHA missing"
+  [ "$(cat "$ROOT/opt/homesteadlink/SOURCE_SHA")" = "$BUILD_HEAD" ] || fail "artifact gate (loop): SOURCE_SHA != build HEAD $BUILD_HEAD"
+  [ "$(sha256sum "$ROOT/opt/homesteadlink/bin/hsl-provisiond" | awk '{print $1}')" = "$(sha256sum "$BIN" | awk '{print $1}')" ] || fail "artifact gate (loop): shipped daemon sha256 != staging daemon sha256"
+  ROOT_VCS=$("$GO" version -m "$ROOT/opt/homesteadlink/bin/hsl-provisiond") || fail "artifact gate (loop): go version -m failed on shipped daemon"
+  echo "$ROOT_VCS" | grep -qF "vcs.revision=$BUILD_HEAD" || fail "artifact gate (loop): shipped daemon vcs.revision != $BUILD_HEAD"
+  echo "$ROOT_VCS" | grep -qF "vcs.modified=false" || fail "artifact gate (loop): shipped daemon vcs.modified is not false"
+  log "artifact gates passed (loop): SOURCE_SHA=$BUILD_HEAD, daemon identity + stamps verified"
   log "injected payload (loop mode)"
   sync; umount "$WORK/mnt"; losetup -d "$LOOP"; LOOP=""; trap - EXIT INT TERM
 else
@@ -423,6 +448,7 @@ else
   assert_stat() { debugfs -R "stat $1" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: regular" || fail "artifact assertion: $1 missing"; }
   assert_stat /opt/homesteadlink/bin/hsl-provisiond
   assert_stat /opt/homesteadlink/VERSION
+  assert_stat /opt/homesteadlink/SOURCE_SHA
   assert_stat /etc/nftables.conf
   assert_stat /etc/hostapd/hostapd.conf
   assert_stat /boot/overlay-user/bt-uart.dtbo
@@ -479,6 +505,15 @@ else
   debugfs -R "dump /etc/hostapd/hostapd.conf $WORK/hostapd.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "cannot dump final hostapd.conf"
   grep -q "AP_PASSPHRASE_FROM_IDENTITY" "$WORK/hostapd.final" || fail "hostapd assertion: shipped /etc/hostapd/hostapd.conf is not the §F1 template"
   log "artifact assertions passed (dpkg set: $ASSERT_PKGS; binaries; firmware; bluetooth conf)"
+  # Final-artifact gates (debugfs): SOURCE_SHA content + daemon identity.
+  debugfs -R "dump /opt/homesteadlink/SOURCE_SHA $WORK/source-sha.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "artifact gate: cannot dump final SOURCE_SHA"
+  [ "$(cat "$WORK/source-sha.final")" = "$BUILD_HEAD" ] || fail "artifact gate: SOURCE_SHA content != build HEAD $BUILD_HEAD"
+  debugfs -R "dump /opt/homesteadlink/bin/hsl-provisiond $WORK/hsl-provisiond.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "artifact gate: cannot dump final daemon"
+  [ "$(sha256sum "$WORK/hsl-provisiond.final" | awk '{print $1}')" = "$(sha256sum "$BIN" | awk '{print $1}')" ] || fail "artifact gate: shipped daemon sha256 != staging daemon sha256 (identity gate)"
+  FINAL_VCS=$("$GO" version -m "$WORK/hsl-provisiond.final") || fail "artifact gate: go version -m failed on shipped daemon"
+  echo "$FINAL_VCS" | grep -qF "vcs.revision=$BUILD_HEAD" || fail "artifact gate: shipped daemon vcs.revision != $BUILD_HEAD"
+  echo "$FINAL_VCS" | grep -qF "vcs.modified=false" || fail "artifact gate: shipped daemon vcs.modified is not false"
+  log "artifact gates passed: SOURCE_SHA=$BUILD_HEAD, daemon identity + stamps verified"
   dd if="$ROOTPART_IMG" of="$IMG" bs=512 seek="$PSTART" conv=notrunc status=none
   log "partition written back into image (debugfs mode)"
 fi
