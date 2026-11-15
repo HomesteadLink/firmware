@@ -33,6 +33,14 @@ func handleControl(cmd string, options map[string]dbus.Variant, s *gattServer) {
 		log.Printf("control: %s rejected — not the owner", cmd)
 		return
 	}
+	doControl(cmd, s)
+}
+
+// doControl executes a Control command with NO owner check. Only
+// callers on a trusted transport use it directly — the USB path
+// (usb.go), where physical possession of the cable is the trust root.
+// The GATT path goes through handleControl.
+func doControl(cmd string, s *gattServer) {
 	switch cmd {
 	case "reboot":
 		log.Printf("control: reboot")

@@ -3,11 +3,15 @@
 // wpa_supplicant Wi-Fi transactions, WireGuard/Tailscale VPN raise,
 // nftables kill switch (loaded by nftables.service; provisiond only
 // verifies it and edits the portal_pass chain), captive-portal
-// handling, AP fallback + config page.
+// handling, AP fallback + config page. The USB transport (usb.go)
+// serves the same operations over a FunctionFS vendor interface for
+// the WebUSB web app: physical USB presence is its trust root — no
+// setup code, no owner token, no lockout on that path.
 package main
 
 import (
 	"crypto/hmac"
+	"flag"
 	"fmt"
 	"crypto/sha256"
 	"encoding/binary"
@@ -569,10 +573,12 @@ func lockoutTicker() {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetPrefix("") // journald adds the unit/tag (SyslogIdentifier=hsl-provisiond)
+	transport := flag.String("transport", "both", "transports to serve: ble, usb, both")
+	flag.Parse()
 	identity = loadIdentity()
 	store.load()
 	bootRecovery()
-	log.Printf("hsl-provisiond %s starting serial_last4=%s model=%q", fwVersion, last4(identity.Serial), modelName)
+	log.Printf("hsl-provisiond %s starting serial_last4=%s model=%q transport=%s", fwVersion, last4(identity.Serial), modelName, *transport)
 
 	// Kill switch (§F4): the merged ruleset is installed at
 	// /etc/nftables.conf and loaded by nftables.service at boot.
@@ -588,11 +594,24 @@ func main() {
 	go provisioningWindowManager()
 	go apFallbackServer()
 
-	gatt, err := startGATT()
-	if err != nil {
-		log.Printf("GATT server failed to start: %v (daemon continues; AP fallback remains)", err)
-	} else {
-		defer gatt.Close()
+	if *transport == "ble" || *transport == "both" {
+		gatt, err := startGATT()
+		if err != nil {
+			log.Printf("GATT server failed to start: %v (daemon continues; AP fallback remains)", err)
+		} else {
+			defer gatt.Close()
+		}
+	} else if *transport != "usb" {
+		log.Printf("unknown --transport %q (want ble|usb|both); serving both", *transport)
+		gatt, err := startGATT()
+		if err != nil {
+			log.Printf("GATT server failed to start: %v (daemon continues; AP fallback remains)", err)
+		} else {
+			defer gatt.Close()
+		}
+	}
+	if *transport == "usb" || *transport == "both" {
+		startUSB()
 	}
 
 	// Boot rejoin (§F4): the state machine derives Status from idle;

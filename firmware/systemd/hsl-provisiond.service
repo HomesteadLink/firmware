@@ -1,10 +1,13 @@
 [Unit]
-Description=HomeSteadyLink provisioning daemon (BLE GATT + Wi-Fi/VPN)
+Description=HomeSteadyLink provisioning daemon (BLE GATT + USB WebUSB + Wi-Fi/VPN)
 # §F2 service graph: After= only. provisiond must NOT Require
 # hsl-bt-attach or bluetooth — it starts without hci0 and serves the
-# config page / Wi-Fi apply path with BT dead (F8).
-After=bluetooth.service hsl-bt-attach.service hsl-firstboot.service network.target nftables.service
-Wants=bluetooth.service hsl-firstboot.service nftables.service
+# config page / Wi-Fi apply path with BT dead (F8). The USB transport
+# likewise only wants the gadget to exist first (it waits for
+# /dev/ffs-usb/ep0 and binds the UDC itself); a missing gadget must
+# not stop the BLE path.
+After=bluetooth.service hsl-bt-attach.service hsl-firstboot.service network.target nftables.service usb-gadget.service
+Wants=bluetooth.service hsl-firstboot.service nftables.service usb-gadget.service
 
 [Service]
 Type=simple
