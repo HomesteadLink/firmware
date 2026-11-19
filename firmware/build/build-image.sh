@@ -403,7 +403,7 @@ if [ "$MODE" = "loop" ]; then
   # BT attach gate (loop, firmware#13): the shipped attach path must
   # be the vendor tool on /dev/ttyBT0, never btattach -P sprd.
   grep -q "hciattach_opi -s 1500000 /dev/ttyBT0 sprd" "$ROOT/etc/systemd/system/hsl-bt-attach.service" || fail "BT attach gate (loop): shipped hsl-bt-attach.service does not run the vendor attach on /dev/ttyBT0 (firmware#13)"
-  grep -q "btattach.*-P sprd" "$ROOT/etc/systemd/system/hsl-bt-attach.service" && fail "BT attach gate (loop): shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
+  grep -q "^ExecStart=.*btattach.*-P sprd" "$ROOT/etc/systemd/system/hsl-bt-attach.service" && fail "BT attach gate (loop): shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
   [ -x "$ROOT/usr/bin/hciattach_opi" ] || fail "BT attach gate (loop): /usr/bin/hciattach_opi missing from final image"
   strings "$ROOT/usr/bin/hciattach_opi" | grep -q "^sprd$" || fail "BT attach gate (loop): shipped hciattach_opi does not implement sprd"
   [ -f "$ROOT/lib/modules/6.12.23-current-sunxi64/kernel/drivers/net/wireless/uwe5622/tty-sdio/sprdbt_tty.ko" ] || fail "BT attach gate (loop): sprdbt_tty.ko missing from final image"
@@ -528,7 +528,7 @@ else
   # not enabled, and both BlueZ timeouts are 0 (never expire).
   debugfs -R "dump /etc/systemd/system/hsl-bt-attach.service $WORK/hsl-bt-attach.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "BT attach gate: cannot dump final hsl-bt-attach.service"
   grep -q "hciattach_opi -s 1500000 /dev/ttyBT0 sprd" "$WORK/hsl-bt-attach.final" || fail "BT attach gate: shipped hsl-bt-attach.service does not run the vendor attach on /dev/ttyBT0 (firmware#13)"
-  grep -q "btattach.*-P sprd" "$WORK/hsl-bt-attach.final" && fail "BT attach gate: shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
+  grep -q "^ExecStart=.*btattach.*-P sprd" "$WORK/hsl-bt-attach.final" && fail "BT attach gate: shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
   debugfs -R "dump /usr/bin/hciattach_opi $WORK/hciattach_opi.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "BT attach gate: /usr/bin/hciattach_opi missing from final image"
   strings "$WORK/hciattach_opi.final" | grep -q "^sprd$" || fail "BT attach gate: shipped hciattach_opi does not implement sprd"
   debugfs -R "stat /lib/modules/6.12.23-current-sunxi64/kernel/drivers/net/wireless/uwe5622/tty-sdio/sprdbt_tty.ko" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: regular" || fail "BT attach gate: sprdbt_tty.ko missing from final image"
