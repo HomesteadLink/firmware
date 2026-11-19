@@ -1,16 +1,24 @@
 [Unit]
-Description=HomeSteadyLink UWE5622 Bluetooth attach (sprd, /dev/ttyS1)
-After=dev-ttyS1.device
-Wants=dev-ttyS1.device
+Description=HomeSteadyLink UWE5622 Bluetooth attach (vendor hciattach_opi, /dev/ttyBT0)
+After=dev-ttyBT0.device
+Wants=dev-ttyBT0.device
 Before=bluetooth.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# §F2 fixes the attach: btattach with the sprd protocol on /dev/ttyS1,
-# 5 retries. No fallback protocols (F17) — a wrong-protocol attach can
-# wedge the UART. Success condition: /sys/class/bluetooth/hci0 exists.
-ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do if [ -e /sys/class/bluetooth/hci0 ]; then exit 0; fi; btattach -B /dev/ttyS1 -P sprd 2>/dev/null || true; for j in 1 2 3 4; do [ -e /sys/class/bluetooth/hci0 ] && exit 0; sleep 0.5; done; sleep 2; done; [ -e /sys/class/bluetooth/hci0 ]'
+# §F2 (firmware#13): the vendor tool is the ONLY attach path. BlueZ
+# btattach has no sprd protocol (BlueZ 5.72 protocol table has no
+# sprd entry; the shipped kernel has no SPRD HCIUART entry), so
+# `btattach -B /dev/ttyS1 -P sprd` fails immediately and hci0 never
+# appears — 41 scans, zero UUID hits. The vendor tool implements
+# sprd (hciattach_sprd.c) and the SDIO TTY node /dev/ttyBT0 comes
+# from sprdbt_tty.ko (loaded via /etc/modules). Wait for the node,
+# then run the vendor attach with retries. Success condition:
+# /sys/class/bluetooth/hci0 exists. The stock aw859a-bluetooth
+# service is masked by the build — this is the single owned path.
+ExecStartPre=/usr/sbin/rfkill unblock all
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do [ -e /dev/ttyBT0 ] && break; sleep 1; done; for i in 1 2 3 4 5; do if [ -e /sys/class/bluetooth/hci0 ]; then exit 0; fi; hciattach_opi -s 1500000 /dev/ttyBT0 sprd 2>/dev/null || true; for j in 1 2 3 4; do [ -e /sys/class/bluetooth/hci0 ] && exit 0; sleep 0.5; done; sleep 2; done; [ -e /sys/class/bluetooth/hci0 ]'
 Restart=on-failure
 RestartSec=2
 
