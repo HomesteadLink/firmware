@@ -385,6 +385,12 @@ if [ "$MODE" = "loop" ]; then
   ln -sf /dev/null "$ROOT/etc/systemd/system/ssh.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/sshd.service"
   ln -sf /dev/null "$ROOT/etc/systemd/system/NetworkManager.service"
+  # §F2 (firmware#13): the stock Armbian attach service is masked —
+  # hsl-bt-attach.service (vendor hciattach_opi on /dev/ttyBT0) is
+  # the single owned attach path for the radio. Two attach services
+  # racing on different nodes is what shipped in v1.3/v1.4.
+  rm -f "$ROOT/etc/systemd/system/multi-user.target.wants/aw859a-bluetooth.service"
+  ln -sf /dev/null "$ROOT/etc/systemd/system/aw859a-bluetooth.service"
   rm -f "$ROOT/root/.not_logged_in_yet" # §F1: Armbian first-login flow disabled
   # Final-artifact gates (loop): SOURCE_SHA content + daemon identity.
   [ -f "$ROOT/opt/homesteadlink/SOURCE_SHA" ] || fail "artifact gate (loop): /opt/homesteadlink/SOURCE_SHA missing"
@@ -394,6 +400,18 @@ if [ "$MODE" = "loop" ]; then
   echo "$ROOT_VCS" | grep -qF "vcs.revision=$BUILD_HEAD" || fail "artifact gate (loop): shipped daemon vcs.revision != $BUILD_HEAD"
   echo "$ROOT_VCS" | grep -qF "vcs.modified=false" || fail "artifact gate (loop): shipped daemon vcs.modified is not false"
   log "artifact gates passed (loop): SOURCE_SHA=$BUILD_HEAD, daemon identity + stamps verified"
+  # BT attach gate (loop, firmware#13): the shipped attach path must
+  # be the vendor tool on /dev/ttyBT0, never btattach -P sprd.
+  grep -q "hciattach_opi -s 1500000 /dev/ttyBT0 sprd" "$ROOT/etc/systemd/system/hsl-bt-attach.service" || fail "BT attach gate (loop): shipped hsl-bt-attach.service does not run the vendor attach on /dev/ttyBT0 (firmware#13)"
+  grep -q "btattach.*-P sprd" "$ROOT/etc/systemd/system/hsl-bt-attach.service" && fail "BT attach gate (loop): shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
+  [ -x "$ROOT/usr/bin/hciattach_opi" ] || fail "BT attach gate (loop): /usr/bin/hciattach_opi missing from final image"
+  strings "$ROOT/usr/bin/hciattach_opi" | grep -q "^sprd$" || fail "BT attach gate (loop): shipped hciattach_opi does not implement sprd"
+  [ -f "$ROOT/lib/modules/6.12.23-current-sunxi64/kernel/drivers/net/wireless/uwe5622/tty-sdio/sprdbt_tty.ko" ] || fail "BT attach gate (loop): sprdbt_tty.ko missing from final image"
+  [ -L "$ROOT/etc/systemd/system/aw859a-bluetooth.service" ] || fail "BT attach gate (loop): stock aw859a-bluetooth.service is not masked"
+  [ ! -e "$ROOT/etc/systemd/system/multi-user.target.wants/aw859a-bluetooth.service" ] || fail "BT attach gate (loop): stock aw859a-bluetooth.service is still enabled"
+  grep -q "^DiscoverableTimeout = 0" "$ROOT/etc/bluetooth/main.conf" || fail "BT attach gate (loop): DiscoverableTimeout is not 0 (firmware#13)"
+  grep -q "^PairableTimeout = 0" "$ROOT/etc/bluetooth/main.conf" || fail "BT attach gate (loop): PairableTimeout is not 0 (firmware#13)"
+  log "BT attach gate passed (loop, firmware#13): vendor attach on /dev/ttyBT0, stock service masked, timeouts 0"
   log "injected payload (loop mode)"
   sync; umount "$WORK/mnt"; losetup -d "$LOOP"; LOOP=""; trap - EXIT INT TERM
 else
@@ -441,6 +459,11 @@ else
   echo "symlink /etc/systemd/system/ssh.service /dev/null" >> "$CMDS"
   echo "symlink /etc/systemd/system/sshd.service /dev/null" >> "$CMDS"
   echo "symlink /etc/systemd/system/NetworkManager.service /dev/null" >> "$CMDS"
+  # §F2 (firmware#13): mask the stock Armbian attach service —
+  # hsl-bt-attach.service (vendor hciattach_opi on /dev/ttyBT0) is
+  # the single owned attach path for the radio.
+  echo "rm /etc/systemd/system/multi-user.target.wants/aw859a-bluetooth.service" >> "$CMDS"
+  echo "symlink /etc/systemd/system/aw859a-bluetooth.service /dev/null" >> "$CMDS"
   # §F1: disable the Armbian first-login flow (trigger exists in stock).
   echo "rm /root/.not_logged_in_yet" >> "$CMDS"
   debugfs -w -f "$CMDS" "$ROOTPART_IMG" > "$WORK/debugfs.log" 2>&1 || fail "debugfs injection failed (see $WORK/debugfs.log)"
@@ -496,6 +519,24 @@ else
   debugfs -R "dump /etc/bluetooth/main.conf $WORK/main.conf.final" "$ROOTPART_IMG" >/dev/null 2>&1 || true
   grep -q "^ControllerMode" "$WORK/main.conf.final" || fail "bluetooth main.conf assertion: no uncommented ControllerMode (F14)"
   grep -q "^Name" "$WORK/main.conf.final" && fail "bluetooth main.conf assertion: Name= present (F14)"
+  # §F2 (firmware#13): BLE attach gate — the shipped attach path must
+  # be the vendor tool, not btattach -P sprd (BlueZ 5.72 has no sprd
+  # protocol, the kernel has no SPRD HCIUART entry, so hci0 could
+  # never appear). Assert: the service runs hciattach_opi on
+  # /dev/ttyBT0, the vendor tool exists and implements sprd, the SDIO
+  # TTY module is present, the stock attach service is masked and
+  # not enabled, and both BlueZ timeouts are 0 (never expire).
+  debugfs -R "dump /etc/systemd/system/hsl-bt-attach.service $WORK/hsl-bt-attach.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "BT attach gate: cannot dump final hsl-bt-attach.service"
+  grep -q "hciattach_opi -s 1500000 /dev/ttyBT0 sprd" "$WORK/hsl-bt-attach.final" || fail "BT attach gate: shipped hsl-bt-attach.service does not run the vendor attach on /dev/ttyBT0 (firmware#13)"
+  grep -q "btattach.*-P sprd" "$WORK/hsl-bt-attach.final" && fail "BT attach gate: shipped hsl-bt-attach.service still uses btattach -P sprd (firmware#13)"
+  debugfs -R "dump /usr/bin/hciattach_opi $WORK/hciattach_opi.final" "$ROOTPART_IMG" >/dev/null 2>&1 || fail "BT attach gate: /usr/bin/hciattach_opi missing from final image"
+  strings "$WORK/hciattach_opi.final" | grep -q "^sprd$" || fail "BT attach gate: shipped hciattach_opi does not implement sprd"
+  debugfs -R "stat /lib/modules/6.12.23-current-sunxi64/kernel/drivers/net/wireless/uwe5622/tty-sdio/sprdbt_tty.ko" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: regular" || fail "BT attach gate: sprdbt_tty.ko missing from final image"
+  debugfs -R "stat /etc/systemd/system/aw859a-bluetooth.service" "$ROOTPART_IMG" 2>/dev/null | grep -q "Type: symlink" || fail "BT attach gate: stock aw859a-bluetooth.service is not masked"
+  debugfs -R "stat /etc/systemd/system/multi-user.target.wants/aw859a-bluetooth.service" "$ROOTPART_IMG" 2>/dev/null | grep -q "Inode:" && fail "BT attach gate: stock aw859a-bluetooth.service is still enabled"
+  grep -q "^DiscoverableTimeout = 0" "$WORK/main.conf.final" || fail "BT attach gate: DiscoverableTimeout is not 0 (firmware#13)"
+  grep -q "^PairableTimeout = 0" "$WORK/main.conf.final" || fail "BT attach gate: PairableTimeout is not 0 (firmware#13)"
+  log "BT attach gate passed (firmware#13): vendor attach on /dev/ttyBT0, stock service masked, timeouts 0"
   # Content assertions: the shipped ruleset must be OURS (hsl_filter,
   # policy drop), not the nftables deb's stock skeleton; the shipped
   # hostapd.conf must be the §F1 template (placeholder passphrase).

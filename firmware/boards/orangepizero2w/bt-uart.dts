@@ -13,10 +13,16 @@
  * "allwinner,sunxi-btlpm" (the sprdbt path; see the Armbian forum
  * record of the vendor DTS nodes for Orange Pi Zero 2, and §F2's
  * "sprdbt compatible path as in the vendor DTS"). It is deliberately
- * NOT an invented string. The runtime attach itself is userspace
- * (hsl-bt-attach.service: btattach -B /dev/ttyS1 -P sprd per §F2);
- * on-hardware verification of ttyS1 + the sprd protocol is the §F2
- * F7.1 gate.
+ * NOT an invented string.
+ *
+ * The overlay is RETAINED but the BT attach no longer uses UART1:
+ * firmware#13 proved `btattach -B /dev/ttyS1 -P sprd` can never
+ * work (no sprd protocol in BlueZ 5.72, no SPRD HCIUART entry in
+ * the kernel), so hsl-bt-attach.service now attaches via the vendor
+ * tool on the SDIO TTY node /dev/ttyBT0. UART1 stays enabled;
+ * nothing opens /dev/ttyS1 for Bluetooth anymore. The §F2 F7.1
+ * gate (on-hardware verification of ttyS1 + the sprd protocol) is
+ * superseded by the vendor path.
  *
  * When dtc is available the build compiles THIS file. On hosts
  * without dtc, build/fdt_tools.py generates the equivalent .dtbo
