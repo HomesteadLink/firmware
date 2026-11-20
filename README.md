@@ -1,5 +1,12 @@
 # HomeSteadyLink — Firmware
 
+**HomeSteadyLink is a pocket USB travel router that makes every site and service think you're home — your traffic exits through your own home connection.**
+
+- **Website:** [homesteadlink.pages.dev](https://homesteadlink.pages.dev/)
+- **Pre-order — $99, pay at shipment:** [homesteadlink.pages.dev/preorder.html](https://homesteadlink.pages.dev/preorder.html)
+- **Kickstarter launching soon** — Early Bird $89 for the first 100 backers. Join the list on the website to get the launch email.
+
+
 Firmware for the HomeSteadyLink travel router (Orange Pi Zero 2W):
 stock Armbian Ubuntu 24.04 + the `/opt/homesteadlink/` payload
 (`hsl-provisiond`, systemd units, configs). The board is provisioned
